@@ -128,6 +128,8 @@ class AuditSummary(BaseModel):
     safety_issue_count: int = 0
     overall_assessment: str = ""
     key_findings: List[str] = []
+    traceable_claims_count: int = 0
+    traceability_percentage: float = 0.0
 
 class AuditOptions(BaseModel):
     verify_sources: bool = True

@@ -28,81 +28,59 @@ def sanitize_source_text(text: str) -> str:
         text = pat.sub('[FILTERED_INSTRUCTION]', text)
     return text
 
+from backend.text_normalizer import sentences
+
 def chunk_text_into_passages(source_id: str, filename: str, full_text: str, page_number: int = 1) -> List[Passage]:
     """
-    Break text into cohesive passages (paragraphs or multi-sentence blocks)
-    while recording exact character offsets and page locations.
+    Build candidate passages from single sentences and adjacent sentence pairs
+    (never treat a whole multi-sentence file as one passage and never default to the first passage).
     """
     passages: List[Passage] = []
     if not full_text.strip():
         return passages
 
-    # Split by double newlines or paragraph breaks
-    raw_paragraphs = [p for p in re.split(r'\n\s*\n', full_text) if p.strip()]
-    
-    current_char_start = 0
+    paragraphs = [p for p in re.split(r'\n\s*\n', full_text) if p.strip()]
     passage_num = 1
 
-    for para in raw_paragraphs:
+    for pi, para in enumerate(paragraphs, 1):
         cleaned_para = para.strip()
         if not cleaned_para:
             continue
         
-        # Locate exact position in full_text
-        found_pos = full_text.find(cleaned_para, current_char_start)
-        if found_pos != -1:
-            start = found_pos
-            end = found_pos + len(cleaned_para)
-            current_char_start = end
-        else:
-            start = current_char_start
-            end = current_char_start + len(cleaned_para)
-            current_char_start = end
+        sents = sentences(cleaned_para.replace("\n", " "))
+        if not sents:
+            sents = [cleaned_para]
 
-        # If a single paragraph is very long (> 1200 chars), subdivide into sentences
-        if len(cleaned_para) > 1200:
-            sentences = re.split(r'(?<=[.!?])\s+', cleaned_para)
-            sub_chunk = ""
-            sub_start = start
-            for sentence in sentences:
-                if len(sub_chunk) + len(sentence) > 800 and sub_chunk:
-                    passages.append(Passage(
-                        id=f"{source_id}_p{page_number}_{passage_num}",
-                        source_id=source_id,
-                        filename=filename,
-                        page_number=page_number,
-                        passage_number=passage_num,
-                        text=sub_chunk.strip(),
-                        char_start=sub_start,
-                        char_end=sub_start + len(sub_chunk.strip())
-                    ))
-                    passage_num += 1
-                    sub_start = sub_start + len(sub_chunk)
-                    sub_chunk = sentence + " "
-                else:
-                    sub_chunk += sentence + " "
-            if sub_chunk.strip():
-                passages.append(Passage(
-                    id=f"{source_id}_p{page_number}_{passage_num}",
-                    source_id=source_id,
-                    filename=filename,
-                    page_number=page_number,
-                    passage_number=passage_num,
-                    text=sub_chunk.strip(),
-                    char_start=sub_start,
-                    char_end=sub_start + len(sub_chunk.strip())
-                ))
-                passage_num += 1
-        else:
+        # Single sentences
+        for si, s in enumerate(sents, 1):
+            c_start = full_text.find(s)
+            c_end = c_start + len(s) if c_start != -1 else 0
             passages.append(Passage(
-                id=f"{source_id}_p{page_number}_{passage_num}",
+                id=f"{source_id}_p{page_number}_{pi}_{si}",
                 source_id=source_id,
                 filename=filename,
                 page_number=page_number,
                 passage_number=passage_num,
-                text=cleaned_para,
-                char_start=start,
-                char_end=end
+                text=s,
+                char_start=max(0, c_start),
+                char_end=max(0, c_end)
+            ))
+            passage_num += 1
+
+        # Adjacent sentence pairs (for multi-sentence claims)
+        for si in range(len(sents) - 1):
+            combined_s = sents[si] + " " + sents[si + 1]
+            c_start = full_text.find(sents[si])
+            c_end = c_start + len(combined_s) if c_start != -1 else 0
+            passages.append(Passage(
+                id=f"{source_id}_p{page_number}_{pi}_{si + 1}-{si + 2}",
+                source_id=source_id,
+                filename=filename,
+                page_number=page_number,
+                passage_number=passage_num,
+                text=combined_s,
+                char_start=max(0, c_start),
+                char_end=max(0, c_end)
             ))
             passage_num += 1
 

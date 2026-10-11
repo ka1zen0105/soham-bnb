@@ -47,6 +47,10 @@ def generate_audit_summary(claims: List[ClaimItem], source_doc_count: int) -> Au
     else:
         assessment = f"Audit complete: {total} claims reviewed across {source_doc_count} source document(s)."
 
+    # Dynamic traceability computation: claims with at least 1 evidence divided by total claims
+    traceable_count = sum(1 for c in claims if (len(c.supporting_evidence) + len(c.contradicting_evidence)) >= 1)
+    traceability_pct = round((traceable_count / total * 100), 1) if total > 0 else 0.0
+
     return AuditSummary(
         total_claims=total,
         supported_count=supported,
@@ -58,7 +62,9 @@ def generate_audit_summary(claims: List[ClaimItem], source_doc_count: int) -> Au
         reasoning_issue_count=reasoning_count,
         safety_issue_count=safety_count,
         overall_assessment=assessment,
-        key_findings=findings
+        key_findings=findings,
+        traceable_claims_count=traceable_count,
+        traceability_percentage=traceability_pct
     )
 
 def export_audit_to_markdown(report: AuditReport) -> str:

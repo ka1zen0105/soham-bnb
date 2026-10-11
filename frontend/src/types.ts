@@ -118,6 +118,8 @@ export interface AuditSummary {
   safety_issue_count: number;
   overall_assessment: string;
   key_findings: string[];
+  traceable_claims_count?: number;
+  traceability_percentage?: number;
 }
 
 export interface AuditOptions {

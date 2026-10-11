@@ -2,9 +2,14 @@ import os
 import json
 import sqlite3
 from typing import List, Optional, Dict, Any
+import tempfile
 from backend.models import AuditReport, AuditListItem, AuditStatusEnum, SourceDocument
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "second_opinion.db")
+DB_PATH = os.environ.get("DB_PATH") or (
+    os.path.join(tempfile.gettempdir(), "second_opinion.db")
+    if os.environ.get("VERCEL")
+    else os.path.join(os.path.dirname(__file__), "second_opinion.db")
+)
 
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)

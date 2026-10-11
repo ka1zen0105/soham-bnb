@@ -7,6 +7,7 @@ from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse
+import tempfile
 import aiofiles
 
 from backend.models import (
@@ -23,7 +24,11 @@ from backend.audit_repository import (
     save_source_doc, get_source_doc
 )
 
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR") or (
+    os.path.join(tempfile.gettempdir(), "second_opinion_uploads")
+    if os.environ.get("VERCEL")
+    else os.path.join(os.path.dirname(__file__), "uploads")
+)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Application settings in memory / env
@@ -37,7 +42,9 @@ settings_state = SettingsConfig(
 app = FastAPI(
     title="Second Opinion AI Auditing API",
     description="Audits AI-generated answers against primary source material with traceable evidence.",
-    version="1.0.0"
+    version="1.0.0",
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json"
 )
 
 app.add_middleware(
@@ -85,6 +92,8 @@ async def execute_audit_pipeline(audit_id: str):
         await asyncio.sleep(0.3)
 
         raw_claims = extract_claims_deterministic(report.answer_text)
+        from backend.claim_extractor import split_claims_into_atomic
+        raw_claims = split_claims_into_atomic(raw_claims)
         if not raw_claims:
             report.status = AuditStatusEnum.FAILED
             report.error_message = "Could not identify verifiable assertions in the provided AI answer."
@@ -109,7 +118,7 @@ async def execute_audit_pipeline(audit_id: str):
         verified_claims: List[ClaimItem] = []
         for idx, claim in enumerate(raw_claims):
             # Check claim
-            v_claim = verify_single_claim(claim, retriever, report.options)
+            v_claim = verify_single_claim(claim, retriever, report.options, source_documents=report.source_documents)
             verified_claims.append(v_claim)
             
             # Incremental progress reporting

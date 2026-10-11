@@ -1,19 +1,21 @@
 import re
 import uuid
 import datetime
-from typing import List, Optional, Tuple, Dict, Any
+import difflib
+from typing import List, Optional, Tuple, Dict, Any, Set
+
 from backend.models import (
     ClaimItem, SourceDocument, Passage, EvidenceQuote, EvidenceRelationshipEnum,
     VerdictEnum, ClaimCategoryEnum, SeverityEnum, AuditOptions
 )
-from backend.evidence_retriever import (
-    BM25Retriever, find_best_sentence_quote, tokenize,
-    create_grounded_evidence_quote, extract_entities_and_numbers
-)
-from backend.numerical_checker import check_numerical_consistency, extract_numbers, extract_dates
+from backend.evidence_retriever import BM25Retriever
+from backend.numerical_checker import check_numerical_consistency, check_date_consistency
 from backend.reasoning_checker import check_reasoning_flaws
 from backend.safety_checker import check_safety_concerns
-from backend.confidence import calculate_confidence
+from backend.text_normalizer import (
+    norm, tokens, sentences, key_tokens, dedupe, STOP,
+    normalize_text, strip_footnote_markers
+)
 
 NEGATION_PAIRS = [
     (re.compile(r'\b(increased|growth|rose|surged|expanded)\b', re.IGNORECASE),
@@ -47,108 +49,324 @@ def detect_semantic_contradiction(claim_text: str, evidence_text: str) -> Option
             return f"Claim indicates '{m_claim}', but source explicitly documents '{m_ev}'."
     return None
 
-def evaluate_passage_for_claim(
-    claim_text: str,
-    passage: Passage,
-    top_score: float
-) -> Tuple[EvidenceRelationshipEnum, Optional[str], Optional[EvidenceQuote], float]:
+def get_doc_passages(doc: Dict[str, Any]) -> List[Passage]:
     """
-    Evaluate whether a single passage ENTAILS, CONTRADICTS, or is NEUTRAL to the claim.
-    Returns (relationship, reason, quote, lexical_overlap).
+    Extract or build candidate passages (single sentences and adjacent sentence pairs).
     """
-    p_text = passage.text
-    claim_tokens = set(tokenize(claim_text))
-    p_tokens = set(tokenize(p_text))
-    overlap = len(claim_tokens.intersection(p_tokens)) / max(len(claim_tokens), 1)
+    existing_passages: List[Passage] = doc.get("passages") or []
+    if existing_passages:
+        multi_sent = any(len(sentences(p.text)) > 1 for p in existing_passages)
+        if not multi_sent:
+            return existing_passages
+        refined: List[Passage] = []
+        p_num = 1
+        for p in existing_passages:
+            sents = sentences(p.text.replace("\n", " "))
+            if len(sents) <= 1:
+                refined.append(p)
+                continue
+            for si, s in enumerate(sents, 1):
+                refined.append(Passage(
+                    id=f"{p.id}_{si}",
+                    source_id=p.source_id,
+                    filename=p.filename,
+                    page_number=p.page_number,
+                    passage_number=p_num,
+                    text=s,
+                    char_start=p.char_start,
+                    char_end=p.char_end
+                ))
+                p_num += 1
+            for si in range(len(sents) - 1):
+                comb = sents[si] + " " + sents[si + 1]
+                refined.append(Passage(
+                    id=f"{p.id}_{si + 1}-{si + 2}",
+                    source_id=p.source_id,
+                    filename=p.filename,
+                    page_number=p.page_number,
+                    passage_number=p_num,
+                    text=comb,
+                    char_start=p.char_start,
+                    char_end=p.char_end
+                ))
+                p_num += 1
+        return refined
 
-    # 1. Deterministic Numerical & Date Consistency Check (requires topical relevance)
-    if overlap >= 0.20 or top_score >= 0.6:
-        num_analysis = check_numerical_consistency(claim_text, p_text)
-        if num_analysis.has_discrepancy:
-            reason = f"Contradiction identified: {num_analysis.detail}"
-            ev_quote = create_grounded_evidence_quote(
-                passage=passage,
-                claim_text=claim_text,
-                similarity_score=top_score,
-                relationship=EvidenceRelationshipEnum.CONTRADICTS
-            )
-            return EvidenceRelationshipEnum.CONTRADICTS, reason, ev_quote, overlap
+    doc_text = doc.get("text") or ""
+    doc_id = doc.get("id") or "doc"
+    doc_name = doc.get("name") or "source.txt"
+    out: List[Passage] = []
+    paragraphs = [p for p in re.split(r"\n\s*\n", doc_text) if p.strip()]
+    p_num = 1
+    for pi, para in enumerate(paragraphs, 1):
+        sents = sentences(para.replace("\n", " "))
+        for si, s in enumerate(sents, 1):
+            out.append(Passage(
+                id=f"{doc_id}_p1_{pi}_{si}",
+                source_id=doc_id,
+                filename=doc_name,
+                page_number=1,
+                passage_number=p_num,
+                text=s,
+                char_start=0,
+                char_end=len(s)
+            ))
+            p_num += 1
+        for si in range(len(sents) - 1):
+            comb = sents[si] + " " + sents[si + 1]
+            out.append(Passage(
+                id=f"{doc_id}_p1_{pi}_{si + 1}-{si + 2}",
+                source_id=doc_id,
+                filename=doc_name,
+                page_number=1,
+                passage_number=p_num,
+                text=comb,
+                char_start=0,
+                char_end=len(comb)
+            ))
+            p_num += 1
+    return out
 
-        # 2. Polar Semantic Negation Check
-        polarity_issue = detect_semantic_contradiction(claim_text, p_text)
-        if polarity_issue:
-            reason = f"Contradiction identified: {polarity_issue}"
-            ev_quote = create_grounded_evidence_quote(
-                passage=passage,
-                claim_text=claim_text,
-                similarity_score=top_score,
-                relationship=EvidenceRelationshipEnum.CONTRADICTS
-            )
-            return EvidenceRelationshipEnum.CONTRADICTS, reason, ev_quote, overlap
+def verify_one_document(claim_text: str, doc: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Verify claim against candidate passages of a single document using verify_reference logic:
+    1. Verbatim normalized containment first
+    2. Candidate ranking by coverage of content words (0.7) and string similarity (0.3)
+    3. Coverage threshold check (< 0.6 yields INSUFFICIENT unless confirmed discrepancy)
+    4. Contradiction only against matched passage (SequenceMatcher replace opcodes on key tokens)
+    5. Numeric/date and semantic contradiction validation
+    """
+    nc = norm(claim_text).lower()
+    c_raw, c_low = tokens(claim_text)
+    c_content = {w for w in c_low if w not in STOP}
+    keys = key_tokens(claim_text)
+    c_passages = get_doc_passages(doc)
 
-    # 3. Grounded Entailment Check
-    # A passage entails only if:
-    # - It has substantial lexical/entity grounding (overlap >= 0.50 or high score >= 1.6)
-    # - If claim contains numbers, ALL claim numbers must be present or corroborated in the passage
-    # - If claim contains dates, dates must align
-    claim_nums = extract_numbers(claim_text)
-    p_nums = extract_numbers(p_text)
-    claim_dates = extract_dates(claim_text)
+    best_p: Optional[Passage] = None
+    best_score = -1.0
+    best_cov = 0.0
 
-    # If claim has specific numbers, ensure they are present in the passage
-    numbers_present = True
-    if claim_nums:
-        for _, c_raw, _ in claim_nums:
-            if c_raw.lower() not in p_text.lower():
-                numbers_present = False
-                break
+    for p in c_passages:
+        np_ = norm(p.text).lower()
+        # 1. Verbatim match first
+        if nc and nc in np_:
+            return {
+                "verdict": VerdictEnum.SUPPORTED,
+                "confidence": 0.99,
+                "passage": p,
+                "doc": doc,
+                "finding": "The claim appears in the source."
+            }
+        _, p_low = tokens(p.text)
+        cov = len(c_content & set(p_low)) / max(1, len(c_content))
+        sim = difflib.SequenceMatcher(None, nc, np_).ratio()
+        score = 0.7 * cov + 0.3 * sim
+        if score > best_score:
+            best_p, best_score, best_cov = p, score, cov
 
-    dates_present = True
-    if claim_dates:
-        for cd in claim_dates:
-            if cd.lower() not in p_text.lower():
-                dates_present = False
-                break
+    if best_p is None:
+        return {
+            "verdict": VerdictEnum.INSUFFICIENT_EVIDENCE,
+            "confidence": 0.50,
+            "passage": None,
+            "doc": doc,
+            "finding": "No passage in the source covers this claim."
+        }
 
-    # Strictly grounded entailment criteria
-    if overlap >= 0.45 and numbers_present and dates_present and top_score >= 0.5:
-        reason = f"Corroborated by {passage.filename} (Page {passage.page_number or 1}). Passage directly matches key assertions."
-        ev_quote = create_grounded_evidence_quote(
-            passage=passage,
-            claim_text=claim_text,
-            similarity_score=top_score,
-            relationship=EvidenceRelationshipEnum.ENTAILS
-        )
-        return EvidenceRelationshipEnum.ENTAILS, reason, ev_quote, overlap
+    # Extract tokens and missing keys for best passage
+    p_raw, p_low = tokens(best_p.text)
+    missing = keys - set(p_low)
 
-    # Topic match but insufficient factual detail
-    ev_quote = create_grounded_evidence_quote(
-        passage=passage,
-        claim_text=claim_text,
-        similarity_score=top_score,
-        relationship=EvidenceRelationshipEnum.NEUTRAL
-    )
-    return EvidenceRelationshipEnum.NEUTRAL, "Passage mentions related topic but lacks sufficient factual evidence to resolve assertion.", ev_quote, overlap
+    # Check numerical and polarity conditions
+    num_analysis = check_numerical_consistency(claim_text, best_p.text)
+    polarity_issue = detect_semantic_contradiction(claim_text, best_p.text)
+
+    # Check specific contradictions that may occur in concise clauses
+    date_mismatch = check_date_consistency(claim_text, best_p.text)
+    if date_mismatch:
+        _, _, detail = date_mismatch
+        finding = f"Contradiction identified: {detail}"
+        conf = round(min(0.95, 0.5 + 0.4 * max(best_cov, 0.3)), 2)
+        return {
+            "verdict": VerdictEnum.CONTRADICTED,
+            "confidence": conf,
+            "passage": best_p,
+            "doc": doc,
+            "finding": finding
+        }
+
+    if polarity_issue and len(c_content & set(p_low)) >= 2:
+        finding = f"Contradiction identified: {polarity_issue}"
+        conf = round(min(0.95, 0.5 + 0.4 * max(best_cov, 0.3)), 2)
+        return {
+            "verdict": VerdictEnum.CONTRADICTED,
+            "confidence": conf,
+            "passage": best_p,
+            "doc": doc,
+            "finding": finding
+        }
+
+    if num_analysis.has_discrepancy and (best_cov >= 0.40 or best_score >= 0.35):
+        finding = f"Contradiction identified: {num_analysis.detail}"
+        conf = round(min(0.95, 0.5 + 0.4 * best_cov), 2)
+        return {
+            "verdict": VerdictEnum.CONTRADICTED,
+            "confidence": conf,
+            "passage": best_p,
+            "doc": doc,
+            "finding": finding,
+            "numerical_analysis": num_analysis
+        }
+
+    # Supported: all key tokens present and strong factual alignment
+    if not missing and (best_cov >= 0.50 or (best_cov >= 0.45 and best_score >= 0.50)):
+        conf = round(min(0.95, best_cov), 2)
+        return {
+            "verdict": VerdictEnum.SUPPORTED,
+            "confidence": conf,
+            "passage": best_p,
+            "doc": doc,
+            "finding": "The source passage states the same facts."
+        }
+
+    # Coverage threshold check: if passage does not cover the claim, it's INSUFFICIENT
+    if best_cov < 0.6:
+        conf = round(min(0.9, max(0.5, 1.0 - best_score)), 2)
+        return {
+            "verdict": VerdictEnum.INSUFFICIENT_EVIDENCE,
+            "confidence": conf,
+            "passage": None,
+            "doc": doc,
+            "finding": "No passage in the source covers this claim."
+        }
+
+    # Passage covers the claim (best_cov >= 0.6). Check key token replacements.
+    pairs = []
+    if missing:
+        sm = difflib.SequenceMatcher(None, c_low, p_low, autojunk=False)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "replace" and any(t in missing for t in c_low[i1:i2]):
+                a = [w for w in c_raw[i1:i2] if w.lower() in missing]
+                pairs.append((" ".join(a), " ".join(p_raw[j1 : j1 + len(a)])))
+
+    if pairs:
+        finding = "Contradiction identified: " + "; ".join(f"claim says '{a}' but the source says '{b}'" for a, b in pairs) + "."
+        conf = round(min(0.9, 0.5 + 0.4 * best_cov), 2)
+        return {
+            "verdict": VerdictEnum.CONTRADICTED,
+            "confidence": conf,
+            "passage": best_p,
+            "doc": doc,
+            "finding": finding,
+            "numerical_analysis": num_analysis
+        }
+
+    if num_analysis.has_discrepancy:
+        finding = f"Contradiction identified: {num_analysis.detail}"
+        conf = round(min(0.95, 0.5 + 0.4 * best_cov), 2)
+        return {
+            "verdict": VerdictEnum.CONTRADICTED,
+            "confidence": conf,
+            "passage": best_p,
+            "doc": doc,
+            "finding": finding,
+            "numerical_analysis": num_analysis
+        }
+
+    if missing:
+        finding = "Contradiction identified: the claim states " + ", ".join(f"'{m}'" for m in sorted(missing)) + " which the matching source passage does not."
+        conf = round(min(0.9, 0.5 + 0.4 * best_cov), 2)
+        return {
+            "verdict": VerdictEnum.CONTRADICTED,
+            "confidence": conf,
+            "passage": best_p,
+            "doc": doc,
+            "finding": finding
+        }
+
+    return {
+        "verdict": VerdictEnum.SUPPORTED,
+        "confidence": round(min(0.95, best_cov), 2),
+        "passage": best_p,
+        "doc": doc,
+        "finding": "The source passage states the same facts."
+    }
+
+    return {
+        "verdict": VerdictEnum.INSUFFICIENT_EVIDENCE,
+        "confidence": 0.55,
+        "passage": best_p,
+        "doc": doc,
+        "finding": "The source passage only partly covers this claim."
+    }
+
+def action_for(verdict: VerdictEnum, results: List[Dict[str, Any]]) -> str:
+    """Generate recommended action text ensuring no file is ever compared with itself."""
+    if verdict == VerdictEnum.SUPPORTED:
+        r = next((x for x in results if x.get("verdict") == VerdictEnum.SUPPORTED), results[0] if results else {})
+        p = r.get("passage")
+        page = getattr(p, "page_number", 1) if p else 1
+        name = r.get("doc", {}).get("name", "source document")
+        return f"Corroborated by {name} (Page {page}). Passage directly matches the claim."
+    if verdict == VerdictEnum.CONTRADICTED:
+        r = next((x for x in results if x.get("verdict") == VerdictEnum.CONTRADICTED), results[0] if results else {})
+        name = r.get("doc", {}).get("name", "source document")
+        return f"Correct the claim to match {name}, or confirm the source is outdated."
+    if verdict == VerdictEnum.CONFLICTING_EVIDENCE:
+        yes = []
+        for x in results:
+            doc_name = x.get("doc", {}).get("name")
+            if x.get("verdict") == VerdictEnum.SUPPORTED and doc_name and doc_name not in yes:
+                yes.append(doc_name)
+        no = []
+        for x in results:
+            doc_name = x.get("doc", {}).get("name")
+            if x.get("verdict") == VerdictEnum.CONTRADICTED and doc_name and doc_name not in no:
+                no.append(doc_name)
+        return f"Sources disagree: {', '.join(yes)} supports the claim while {', '.join(no)} contradicts it. Decide which source to trust."
+    return "No provided source supports this claim. Add a source that covers it, or remove the claim."
 
 def verify_single_claim(
     claim: ClaimItem,
     retriever: BM25Retriever,
     options: AuditOptions,
-    gemini_client = None
+    gemini_client = None,
+    source_documents: Optional[List[SourceDocument]] = None
 ) -> ClaimItem:
     """
-    Verify a single atomic claim against indexed source passages using multi-passage analysis.
-    Distinguishes SUPPORTED, CONTRADICTED, INSUFFICIENT_EVIDENCE, CONFLICTING_EVIDENCE, and MIXED.
+    Verify a single atomic claim using the reference multi-passage architecture.
     """
-    # 1. Retrieve candidates
-    ranked_passages = retriever.retrieve(claim.text, top_k=5)
+    docs: List[Dict[str, Any]] = []
+    if source_documents:
+        for d in source_documents:
+            docs.append({
+                "name": d.filename,
+                "text": d.extracted_text,
+                "id": d.id,
+                "source_doc": d,
+                "passages": d.passages
+            })
+    else:
+        docs_by_id: Dict[str, Dict[str, Any]] = {}
+        for p in retriever.passages:
+            key = p.source_id
+            if key not in docs_by_id:
+                docs_by_id[key] = {
+                    "name": p.filename,
+                    "text": "",
+                    "id": p.source_id,
+                    "passages": []
+                }
+            docs_by_id[key]["passages"].append(p)
+        for d in docs_by_id.values():
+            d["text"] = "\n\n".join(p.text for p in d["passages"])
+        docs = list(docs_by_id.values())
 
-    # Reasoning and Safety checks
-    if options.reasoning_checks:
-        claim.reasoning_issues = check_reasoning_flaws(
-            claim.text,
-            ranked_passages[0][0].text if ranked_passages else ""
-        )
+    uniq = dedupe(docs)
+
+    # Optional reasoning and safety checks
+    if options.reasoning_checks and retriever.passages:
+        claim.reasoning_issues = check_reasoning_flaws(claim.text, retriever.passages[0].text)
     if options.safety_review:
         claim.safety_issues = check_safety_concerns(claim.text)
         if claim.safety_issues:
@@ -158,180 +376,202 @@ def verify_single_claim(
             )
             claim.severity = highest_sev
 
-    # If no relevant passages found in source material
-    if not ranked_passages or ranked_passages[0][1] < 0.20:
-        claim.verdict = VerdictEnum.INSUFFICIENT_EVIDENCE
-        claim.explanation = "No sufficient supporting evidence found in the provided source material."
-        claim.supporting_evidence = []
-        claim.contradicting_evidence = []
-        claim.suggested_correction = None
-        claim.confidence_score, claim.confidence_basis = calculate_confidence(
-            verdict=VerdictEnum.INSUFFICIENT_EVIDENCE,
-            retrieval_score=ranked_passages[0][1] if ranked_passages else 0.0,
-            lexical_overlap=0.0,
-            numerical_analysis=check_numerical_consistency(claim.text, ""),
-            has_exact_quote=False
-        )
-        return claim
+    # =========================================================================
+    # =========================================================================
+    # SINGLE ATOMIC CLAIM VERIFICATION ACROSS DOCUMENTS
+    # =========================================================================
+    results = [verify_one_document(claim.text, d) for d in uniq]
+    sup = [r for r in results if r["verdict"] == VerdictEnum.SUPPORTED]
+    con = [r for r in results if r["verdict"] == VerdictEnum.CONTRADICTED]
 
-    # 2. Evaluate each retrieved candidate passage
+    # If single claim is not supported/contradicted, and sub-claims exist, check sub-claims
+    if not sup and not con and claim.sub_claims and len(claim.sub_claims) > 1:
+        part_evals: List[bool] = []
+        part_quotes: List[EvidenceQuote] = []
+        part_contra_quotes: List[EvidenceQuote] = []
+        part_contra_findings: List[str] = []
+        for part in claim.sub_claims:
+            p_text = part["text"]
+            p_res = [verify_one_document(p_text, d) for d in uniq]
+            p_sup = any(r["verdict"] == VerdictEnum.SUPPORTED for r in p_res)
+            p_con = any(r["verdict"] == VerdictEnum.CONTRADICTED for r in p_res)
+            part_evals.append(p_sup)
+            if p_con:
+                con_r = next(r for r in p_res if r["verdict"] == VerdictEnum.CONTRADICTED)
+                p_passage = con_r.get("passage")
+                part["verdict"] = "CONTRADICTED"
+                part_contra_findings.append(con_r["finding"])
+                if p_passage:
+                    part_contra_quotes.append(EvidenceQuote(
+                        id=f"ev_{uuid.uuid4().hex[:8]}",
+                        source_id=con_r["doc"]["id"],
+                        filename=con_r["doc"]["name"],
+                        page_number=getattr(p_passage, "page_number", 1) or 1,
+                        passage_id=getattr(p_passage, "id", f"{con_r['doc']['id']}_p1_1"),
+                        text=getattr(p_passage, "text", ""),
+                        similarity_score=con_r["confidence"],
+                        relationship=EvidenceRelationshipEnum.CONTRADICTS,
+                        is_contradiction=True,
+                        exact_match_verified=True
+                    ))
+            elif p_sup:
+                part["verdict"] = "SUPPORTED"
+                sup_r = next(r for r in p_res if r["verdict"] == VerdictEnum.SUPPORTED)
+                p_passage = sup_r.get("passage")
+                part["quote"] = p_passage.text if p_passage else ""
+                part_quotes.append(EvidenceQuote(
+                    id=f"ev_{uuid.uuid4().hex[:8]}",
+                    source_id=sup_r["doc"]["id"],
+                    filename=sup_r["doc"]["name"],
+                    page_number=getattr(p_passage, "page_number", 1) or 1,
+                    passage_id=getattr(p_passage, "id", f"{sup_r['doc']['id']}_p1_1"),
+                    text=getattr(p_passage, "text", ""),
+                    similarity_score=sup_r["confidence"],
+                    relationship=EvidenceRelationshipEnum.ENTAILS,
+                    is_contradiction=False,
+                    exact_match_verified=True
+                ))
+            else:
+                part["verdict"] = "INSUFFICIENT_EVIDENCE"
+
+        if part_contra_quotes:
+            claim.verdict = VerdictEnum.CONTRADICTED
+            claim.explanation = part_contra_findings[0]
+            claim.contradicting_evidence = part_contra_quotes[:1]
+            claim.supporting_evidence = []
+            claim.severity = SeverityEnum.HIGH
+            claim.confidence_score = 0.85
+            claim.confidence_basis = "Sub-assertion contradicted by primary source documentation."
+            claim.suggested_correction = action_for(VerdictEnum.CONTRADICTED, [{
+                "verdict": VerdictEnum.CONTRADICTED,
+                "doc": {"name": part_contra_quotes[0].filename}
+            }])
+            return claim
+
+        if all(part_evals):
+            claim.verdict = VerdictEnum.SUPPORTED
+            claim.explanation = "All sub-assertions corroborated by source documentation."
+            claim.supporting_evidence = part_quotes[:1]
+            claim.contradicting_evidence = []
+            claim.confidence_score = 0.95
+            claim.confidence_basis = "All sub-assertions corroborated by primary source documentation."
+            claim.suggested_correction = action_for(VerdictEnum.SUPPORTED, [{
+                "verdict": VerdictEnum.SUPPORTED,
+                "doc": {"name": part_quotes[0].filename},
+                "passage": {"page": part_quotes[0].page_number}
+            }])
+            return claim
+        elif any(part_evals):
+            claim.verdict = VerdictEnum.MIXED
+            sup_count = sum(1 for e in part_evals if e)
+            claim.explanation = (
+                f"Partially supported: {sup_count} of {len(claim.sub_claims)} sub-assertions corroborated by source passages, "
+                f"while remaining clauses lack sufficient evidentiary backing."
+            )
+            claim.supporting_evidence = part_quotes[:1]
+            claim.contradicting_evidence = []
+            claim.confidence_score = 0.83
+            claim.confidence_basis = "Claim contains both corroborated components and unverified sub-clauses."
+            claim.suggested_correction = (
+                f"Qualify assertion: align specifically with documented passage '{part_quotes[0].text}'."
+                if part_quotes else None
+            )
+            return claim
+
+    if len(uniq) >= 2 and sup and con:
+        verdict = VerdictEnum.CONFLICTING_EVIDENCE
+        shown = sup + con
+        finding = "Conflicting evidence: different source documents disagree about this claim."
+    elif sup:
+        verdict = VerdictEnum.SUPPORTED
+        shown = sup
+        finding = sup[0]["finding"]
+    elif con:
+        verdict = VerdictEnum.CONTRADICTED
+        shown = con
+        finding = con[0]["finding"]
+    else:
+        verdict = VerdictEnum.INSUFFICIENT_EVIDENCE
+        shown = results
+        finding = results[0]["finding"] if results else "No passage in the source covers this claim."
+
+    conf = round(sum(r["confidence"] for r in shown) / max(1, len(shown)), 2)
+
+    claim.verdict = verdict
+    claim.explanation = finding
+    claim.confidence_score = conf
+    claim.confidence_basis = f"Computed from verification match quality against primary source evidence."
+    claim.suggested_correction = action_for(verdict, shown)
+
+    # Attach evidence quotes
     supporting_quotes: List[EvidenceQuote] = []
     contradicting_quotes: List[EvidenceQuote] = []
-    contradiction_reasons: List[str] = []
-    support_reasons: List[str] = []
-    best_overlap = 0.0
-    primary_passage = ranked_passages[0][0]
-    primary_score = ranked_passages[0][1]
 
-    for p, score in ranked_passages:
-        rel, reason, quote, overlap = evaluate_passage_for_claim(claim.text, p, score)
-        best_overlap = max(best_overlap, overlap)
-
-        if rel == EvidenceRelationshipEnum.CONTRADICTS:
-            contradicting_quotes.append(quote)
-            if reason:
-                contradiction_reasons.append(reason)
-        elif rel == EvidenceRelationshipEnum.ENTAILS:
-            supporting_quotes.append(quote)
-            if reason:
-                support_reasons.append(reason)
-
-    # If full claim did not yield direct supporting quote, evaluate individual sub-clauses
-    if not supporting_quotes and claim.sub_claims and len(claim.sub_claims) > 1:
-        for sc in claim.sub_claims:
-            sc_text = sc["text"]
-            for p, score in ranked_passages:
-                rel_sc, reason_sc, quote_sc, overlap_sc = evaluate_passage_for_claim(sc_text, p, score)
-                best_overlap = max(best_overlap, overlap_sc)
-                if rel_sc == EvidenceRelationshipEnum.ENTAILS:
-                    sc["verdict"] = "SUPPORTED"
-                    sc["quote"] = quote_sc.text
-                    supporting_quotes.append(quote_sc)
-                    support_reasons.append(f"Sub-clause '{sc_text}' corroborated by {p.filename}.")
-                    break
-                elif rel_sc == EvidenceRelationshipEnum.CONTRADICTS:
-                    sc["verdict"] = "CONTRADICTED"
-                    contradicting_quotes.append(quote_sc)
-                    if reason_sc:
-                        contradiction_reasons.append(reason_sc)
-                    break
-            if "verdict" not in sc or not sc["verdict"]:
-                sc["verdict"] = "INSUFFICIENT_EVIDENCE"
-
-    # Update numerical analysis on claim from primary candidate
-    claim.numerical_analysis = check_numerical_consistency(claim.text, primary_passage.text)
-
-    # 3. Decision Matrix
-    # Case A: CONFLICTING_EVIDENCE (both supporting and contradicting sources exist)
-    if supporting_quotes and contradicting_quotes:
-        claim.verdict = VerdictEnum.CONFLICTING_EVIDENCE
-        claim.explanation = (
-            f"Conflicting evidence found across sources: {contradiction_reasons[0]} "
-            f"However, other passages corroborate aspects of the claim."
+    for r in shown:
+        p = r.get("passage")
+        if not p:
+            continue
+        eq = EvidenceQuote(
+            id=f"ev_{uuid.uuid4().hex[:8]}",
+            source_id=r["doc"]["id"],
+            filename=r["doc"]["name"],
+            page_number=getattr(p, "page_number", 1) or 1,
+            passage_id=getattr(p, "id", f"{r['doc']['id']}_p1_1"),
+            text=getattr(p, "text", ""),
+            similarity_score=r["confidence"],
+            relationship=EvidenceRelationshipEnum.ENTAILS if r["verdict"] == VerdictEnum.SUPPORTED else EvidenceRelationshipEnum.CONTRADICTS,
+            is_contradiction=(r["verdict"] == VerdictEnum.CONTRADICTED),
+            exact_match_verified=True
         )
-        claim.supporting_evidence = [supporting_quotes[0]]
-        claim.contradicting_evidence = [contradicting_quotes[0]]
+        if r["verdict"] == VerdictEnum.SUPPORTED:
+            supporting_quotes.append(eq)
+        elif r["verdict"] == VerdictEnum.CONTRADICTED:
+            contradicting_quotes.append(eq)
+
+    claim.supporting_evidence = supporting_quotes
+    claim.contradicting_evidence = contradicting_quotes
+
+    # Attach numerical analysis if present
+    for r in shown:
+        if r.get("numerical_analysis"):
+            claim.numerical_analysis = r["numerical_analysis"]
+            break
+    if not claim.numerical_analysis and retriever.passages:
+        claim.numerical_analysis = check_numerical_consistency(claim.text, retriever.passages[0].text)
+
+    if verdict == VerdictEnum.CONTRADICTED:
         claim.severity = SeverityEnum.HIGH
-        claim.suggested_correction = f"Reconcile divergent source accounts: compare {contradicting_quotes[0].filename} and {supporting_quotes[0].filename}."
-        claim.confidence_score, claim.confidence_basis = calculate_confidence(
-            verdict=VerdictEnum.CONFLICTING_EVIDENCE,
-            retrieval_score=primary_score,
-            lexical_overlap=best_overlap,
-            numerical_analysis=claim.numerical_analysis,
-            has_exact_quote=True
-        )
-        return claim
-
-    # Case B: CONTRADICTED (at least one direct contradiction, zero entailment)
-    if contradicting_quotes:
-        claim.verdict = VerdictEnum.CONTRADICTED
-        if claim.numerical_analysis and claim.numerical_analysis.has_discrepancy:
-            claim.category = ClaimCategoryEnum.NUMERICAL
-        claim.explanation = contradiction_reasons[0]
+    elif verdict == VerdictEnum.CONFLICTING_EVIDENCE:
         claim.severity = SeverityEnum.HIGH
-        claim.contradicting_evidence = [contradicting_quotes[0]]
-        claim.supporting_evidence = []
-        
-        contra_ev = contradicting_quotes[0]
-        claim.suggested_correction = f"Revise statement according to {contra_ev.filename} (Page {contra_ev.page_number or 1}): '{contra_ev.text}'."
-        claim.confidence_score, claim.confidence_basis = calculate_confidence(
-            verdict=VerdictEnum.CONTRADICTED,
-            retrieval_score=primary_score,
-            lexical_overlap=best_overlap,
-            numerical_analysis=claim.numerical_analysis,
-            has_exact_quote=True
-        )
-        return claim
 
-    # Case C: SUPPORTED or MIXED (supporting quotes present, zero contradictions)
-    if supporting_quotes:
-        # Check if multi-part claim needs decomposition
-        if claim.sub_claims and len(claim.sub_claims) > 1:
-            # Check each sub-part
-            part_evals = []
-            for part in claim.sub_claims:
-                part_text = part["text"]
-                part_supported = False
-                for p, score in ranked_passages:
-                    rel_p, _, _, _ = evaluate_passage_for_claim(part_text, p, score)
-                    if rel_p == EvidenceRelationshipEnum.ENTAILS:
-                        part_supported = True
-                        break
-                part["verdict"] = "SUPPORTED" if part_supported else "INSUFFICIENT_EVIDENCE"
-                part_evals.append(part_supported)
-
-            if all(part_evals):
-                claim.verdict = VerdictEnum.SUPPORTED
-                claim.explanation = f"All sub-assertions corroborated by {supporting_quotes[0].filename} (Page {supporting_quotes[0].page_number or 1})."
-                claim.supporting_evidence = [supporting_quotes[0]]
-                claim.contradicting_evidence = []
-                claim.suggested_correction = None
-            else:
-                claim.verdict = VerdictEnum.MIXED
-                sup_count = sum(1 for e in part_evals if e)
-                claim.explanation = (
-                    f"Partially supported: {sup_count} of {len(claim.sub_claims)} sub-assertions corroborated by source passages, "
-                    f"while remaining clauses lack sufficient evidentiary backing."
-                )
-                claim.supporting_evidence = [supporting_quotes[0]]
-                claim.contradicting_evidence = []
-                claim.suggested_correction = f"Qualify assertion: align specifically with documented passage '{supporting_quotes[0].text}'."
-                claim.confidence_score, claim.confidence_basis = calculate_confidence(
-                    verdict=VerdictEnum.MIXED,
-                    retrieval_score=primary_score,
-                    lexical_overlap=best_overlap,
-                    numerical_analysis=claim.numerical_analysis,
-                    has_exact_quote=True
-                )
-                return claim
-        else:
-            claim.verdict = VerdictEnum.SUPPORTED
-            claim.explanation = support_reasons[0] if support_reasons else f"Corroborated by {supporting_quotes[0].filename} (Page {supporting_quotes[0].page_number or 1})."
-            claim.supporting_evidence = [supporting_quotes[0]]
-            claim.contradicting_evidence = []
-            claim.suggested_correction = None
-
-        claim.confidence_score, claim.confidence_basis = calculate_confidence(
-            verdict=VerdictEnum.SUPPORTED,
-            retrieval_score=primary_score,
-            lexical_overlap=best_overlap,
-            numerical_analysis=claim.numerical_analysis,
-            has_exact_quote=True
-        )
-        return claim
-
-    # Case D: INSUFFICIENT_EVIDENCE (sources discuss related topic but don't resolve the claim)
-    # Important: Do not infer that a claim is false simply because evidence was not found!
-    claim.verdict = VerdictEnum.INSUFFICIENT_EVIDENCE
-    claim.explanation = "Retrieved source passages discuss related terminology but provide insufficient evidence to corroborate or refute the specific claim."
-    claim.supporting_evidence = []
-    claim.contradicting_evidence = []
-    claim.suggested_correction = None
-    claim.confidence_score, claim.confidence_basis = calculate_confidence(
-        verdict=VerdictEnum.INSUFFICIENT_EVIDENCE,
-        retrieval_score=primary_score,
-        lexical_overlap=best_overlap,
-        numerical_analysis=claim.numerical_analysis,
-        has_exact_quote=False
-    )
     return claim
+
+def evaluate_passage_for_claim(
+    claim_text: str,
+    passage: Passage,
+    top_score: float
+) -> Tuple[EvidenceRelationshipEnum, Optional[str], Optional[EvidenceQuote], float]:
+    """
+    Backward-compatible single-passage evaluation helper.
+    """
+    dummy_doc = {"name": passage.filename, "id": passage.source_id, "text": passage.text, "passages": [passage]}
+    res = verify_one_document(claim_text, dummy_doc)
+    p = res.get("passage")
+    quote = None
+    if p:
+        quote = EvidenceQuote(
+            id=f"ev_{uuid.uuid4().hex[:8]}",
+            source_id=dummy_doc["id"],
+            filename=dummy_doc["name"],
+            page_number=getattr(p, "page_number", 1) or 1,
+            passage_id=getattr(p, "id", f"{dummy_doc['id']}_p1_1"),
+            text=getattr(p, "text", ""),
+            similarity_score=res["confidence"],
+            relationship=EvidenceRelationshipEnum.ENTAILS if res["verdict"] == VerdictEnum.SUPPORTED else EvidenceRelationshipEnum.CONTRADICTS,
+            is_contradiction=(res["verdict"] == VerdictEnum.CONTRADICTED),
+            exact_match_verified=True
+        )
+    rel = EvidenceRelationshipEnum.ENTAILS if res["verdict"] == VerdictEnum.SUPPORTED else (
+        EvidenceRelationshipEnum.CONTRADICTS if res["verdict"] == VerdictEnum.CONTRADICTED else EvidenceRelationshipEnum.NEUTRAL
+    )
+    return rel, res["finding"], quote, res["confidence"]

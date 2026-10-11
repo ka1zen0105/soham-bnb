@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { 
   LayoutDashboard, 
   PlusCircle, 
@@ -7,6 +7,7 @@ import {
   X
 } from 'lucide-react';
 import { LogoIcon } from './Logo';
+import { fetchAudit } from '../services/api';
 
 interface SidebarProps {
   currentRoute: string;
@@ -21,6 +22,25 @@ export const Sidebar: React.FC<SidebarProps> = ({
   isOpenMobile,
   setIsOpenMobile
 }) => {
+  const [traceablePct, setTraceablePct] = useState<number | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    if (currentRoute.startsWith('/audit/') && currentRoute !== '/audit/new') {
+      const auditId = currentRoute.replace('/audit/', '');
+      fetchAudit(auditId).then(data => {
+        if (!alive || !data || !data.claims) return;
+        const total = data.claims.length;
+        const withEvidence = data.claims.filter(c => ((c.supporting_evidence?.length || 0) + (c.contradicting_evidence?.length || 0)) >= 1).length;
+        const pct = total > 0 ? Math.round((withEvidence / total) * 100) : 0;
+        setTraceablePct(pct);
+      }).catch(() => {});
+    } else {
+      setTraceablePct(null);
+    }
+    return () => { alive = false; };
+  }, [currentRoute]);
+
   const mainNav = [
     { id: '/', label: 'Dashboard', icon: LayoutDashboard, badge: null },
     { id: '/audit/new', label: 'New Audit', icon: PlusCircle, badge: 'NEW' },
@@ -125,14 +145,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
           {/* Progress bar */}
           <div className="w-full bg-[#EEF0F3] rounded-full h-1 overflow-hidden">
             <div 
-              className="bg-[var(--ink)] h-1 rounded-full" 
-              style={{ width: '78%' }}
+              className="bg-[var(--ink)] h-1 rounded-full transition-all duration-300" 
+              style={{ width: `${traceablePct !== null ? traceablePct : 100}%` }}
             />
           </div>
           
           <div className="flex items-center justify-between text-[12px] text-[var(--text-secondary)] font-normal">
             <span>SQLite persistent</span>
-            <span>100% traceable</span>
+            <span>{traceablePct !== null ? `${traceablePct}% traceable` : '100% traceable'}</span>
           </div>
         </div>
       </aside>

@@ -1,15 +1,17 @@
 import re
 from typing import List, Tuple, Optional, Dict, Any
 from backend.models import NumericalDiscrepancy
+from backend.text_normalizer import normalize_text, strip_footnote_markers
 
 DATE_PATTERN = re.compile(
     r'\b(?:(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(?:\d{1,2}(?:st|nd|rd|th)?,\s+)?\d{4}|Q[1-4]\s+\d{4})\b',
     re.IGNORECASE
 )
 
-YEAR_ONLY_PATTERN = re.compile(r'\b(19\d\d|20\d\d)\b')
+# Multi-century year matching (1600 - 2099)
+YEAR_ONLY_PATTERN = re.compile(r'\b(1[6789]\d\d|20\d\d)\b')
 
-# Strict scale matching that requires complete words (never partial words like 'm' in 'met' or 'months')
+# Strict scale matching that requires complete words
 NUMBER_PATTERN = re.compile(
     r'(?P<currency>[\$\€\£\¥])?\s*(?P<number>\d+(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>\b(?:billion|million|trillion|thousand)\b)?\s*(?P<percent>%)?',
     re.IGNORECASE
@@ -20,7 +22,8 @@ IDENTIFIER_PATTERN = re.compile(r'[a-zA-Z]+-\d+|\bQ[1-4]\b|\bISO/\w+\b', re.IGNO
 
 def extract_dates(text: str) -> List[str]:
     """Extract standard full date strings and financial quarters."""
-    return [m.group(0).strip() for m in DATE_PATTERN.finditer(text)]
+    cleaned = strip_footnote_markers(text)
+    return [m.group(0).strip() for m in DATE_PATTERN.finditer(cleaned)]
 
 def parse_number_value(match: re.Match) -> Tuple[float, str, str]:
     """Parse matched number into (normalized_float, raw_str, category)."""
@@ -54,14 +57,15 @@ def extract_numbers(text: str) -> List[Tuple[float, str, str]]:
     Extract numbers with categories, excluding numbers that are purely part of full date strings,
     quarters, or product identifiers (like BC-902).
     """
-    date_spans = [m.span() for m in DATE_PATTERN.finditer(text)]
-    identifier_spans = [m.span() for m in IDENTIFIER_PATTERN.finditer(text)]
+    cleaned = strip_footnote_markers(text)
+    date_spans = [m.span() for m in DATE_PATTERN.finditer(cleaned)]
+    identifier_spans = [m.span() for m in IDENTIFIER_PATTERN.finditer(cleaned)]
 
     results = []
-    for m in NUMBER_PATTERN.finditer(text):
+    for m in NUMBER_PATTERN.finditer(cleaned):
         m_start, m_end = m.span()
         
-        # Check if this number is contained inside a full date or identifier expression
+        # Check if contained inside full date or identifier
         inside_date = any(d_start <= m_start and m_end <= d_end for d_start, d_end in date_spans)
         inside_id = any(i_start <= m_start and m_end <= i_end for i_start, i_end in identifier_spans)
         
@@ -69,13 +73,13 @@ def extract_numbers(text: str) -> List[Tuple[float, str, str]]:
             continue
 
         raw = m.group(0).strip()
-        if inside_date and not YEAR_ONLY_PATTERN.match(raw):
+        if inside_date:
             continue
 
         try:
             val, raw_str, category = parse_number_value(m)
             # Avoid matching trivial isolated single digits like "1" or "2" unless currency/percent
-            if category == "QUANTITY" and val < 10 and not match_has_unit(m, text):
+            if category == "QUANTITY" and val < 10 and not match_has_unit(m, cleaned):
                 continue
             results.append((val, raw_str, category))
         except (ValueError, TypeError):
@@ -93,11 +97,21 @@ def check_date_consistency(claim_text: str, evidence_text: str) -> Optional[Tupl
     """
     Check if a specific date or year in claim contradicts date in evidence.
     Returns (claim_date, evidence_date, explanation) if discrepancy found.
+    Only checks when the texts discuss related events.
     """
     claim_dates = extract_dates(claim_text)
     evidence_dates = extract_dates(evidence_text)
 
     if claim_dates and evidence_dates:
+        # Require topical overlap between sentences
+        c_norm_words = set(normalize_text(claim_text).split())
+        e_norm_words = set(normalize_text(evidence_text).split())
+        shared = c_norm_words.intersection(e_norm_words)
+        # If they share at least one non-trivial keyword (e.g. action, fda, trial, revenue, review)
+        non_trivial_shared = [w for w in shared if len(w) > 3 and w not in ('with', 'from', 'that', 'this')]
+        if not non_trivial_shared:
+            return None
+
         for cd in claim_dates:
             if cd.lower() in evidence_text.lower():
                 continue
@@ -112,6 +126,7 @@ def check_numerical_consistency(claim_text: str, evidence_text: str) -> Numerica
     Deterministically compare numerical figures and dates between claim and evidence.
     Only flags discrepancies when the metric category and subject context match.
     """
+    # 1. Date consistency check
     date_mismatch = check_date_consistency(claim_text, evidence_text)
     if date_mismatch:
         c_date, e_date, detail = date_mismatch
@@ -130,6 +145,11 @@ def check_numerical_consistency(claim_text: str, evidence_text: str) -> Numerica
     if not claim_nums or not evidence_nums:
         return NumericalDiscrepancy(has_discrepancy=False)
 
+    # Context relevance check: claim and evidence must share context keywords
+    c_words = set(normalize_text(claim_text).split())
+    e_words = set(normalize_text(evidence_text).split())
+    shared_words = c_words.intersection(e_words)
+
     discrepancy_found = False
     mismatched_claim_nums = []
     mismatched_ev_nums = []
@@ -139,6 +159,24 @@ def check_numerical_consistency(claim_text: str, evidence_text: str) -> Numerica
     for c_val, c_raw, c_cat in claim_nums:
         exact_found = any(c_raw.lower() == e_raw.lower() for _, e_raw, _ in evidence_nums)
         if exact_found:
+            continue
+
+        # If YEAR, compare for exact equality only (never apply percentage tolerance to years/dates)
+        if c_cat == "YEAR":
+            if len(shared_words) >= 5:
+                compatible_ev = [
+                    (e_val, e_raw, e_cat) for e_val, e_raw, e_cat in evidence_nums
+                    if e_cat == "YEAR"
+                ]
+                if compatible_ev:
+                    closest = min(compatible_ev, key=lambda x: abs(x[0] - c_val))
+                    if abs(c_val - closest[0]) > 0:
+                        discrepancy_found = True
+                        mismatched_claim_nums.append(c_raw)
+                        mismatched_ev_nums.append(closest[1])
+                        detail_reasons.append(
+                            f"Claim specifies year '{c_raw}' but source passage documents '{closest[1]}'"
+                        )
             continue
 
         compatible_ev = [

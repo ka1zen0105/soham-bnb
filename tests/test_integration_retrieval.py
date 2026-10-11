@@ -23,7 +23,8 @@ class TestIntegrationRetrievalAndPersistence(unittest.TestCase):
         self.doc_text_1 = """BIOCORP PHARMACEUTICALS - Q3 2024 FINANCIAL REPORT
 SECTION 1: FINANCIAL HIGHLIGHTS
 Total consolidated revenue for the third quarter ended September 30, 2024 was $162 million, an increase of 14% compared to $142 million in Q3 2023. Operating margins contracted slightly to 26.2%.
-Cash, cash equivalents, and marketable securities totaled $420 million as of September 30, 2024."""
+Cash, cash equivalents, and marketable securities totaled $420 million as of September 30, 2024.
+Pipeline Overview: The Phase 3 trial for BC-902 met all primary endpoints with zero observed adverse cardiovascular events."""
 
         self.doc_text_2 = """SECTION 2: PIPELINE & CLINICAL TRIALS
 BC-902 Phase 3 Clinical Study:
