@@ -1,17 +1,37 @@
+# Python
 venv/
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 *.db
 backend/uploads/
-.env
+
+# Node & Dependencies
 node_modules/
+*/node_modules/
+
+# Environment Variables & Secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Build outputs
+dist/
+*/dist/
+.next/
 frontend/dist/
 frontend/.vite/
-evaluation_benchmark_results.json
+
+# Vercel & Deployments
+.vercel/
+
+# Logs & Temporary files
 *.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+evaluation_benchmark_results.json
 .DS_Store
 Thumbs.db
-.vercel
-
