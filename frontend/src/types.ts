@@ -143,6 +143,7 @@ export interface AuditReport {
   claims: ClaimItem[];
   summary: AuditSummary;
   options: AuditOptions;
+  parent_audit_id?: string | null;
 }
 
 export interface AuditListItem {
@@ -156,6 +157,31 @@ export interface AuditListItem {
   insufficient_count: number;
   ambiguous_count: number;
   source_doc_count: number;
+  parent_audit_id?: string | null;
+}
+
+export interface AuditInputsResponse {
+  audit_id: string;
+  title: string;
+  answer_text: string;
+  options: AuditOptions;
+  source_documents: SourceDocument[];
+  parent_audit_id?: string | null;
+}
+
+export interface EditedDocumentInput {
+  id?: string;
+  filename: string;
+  text: string;
+}
+
+export interface AuditRerunRequest {
+  title?: string;
+  answer_text: string;
+  source_document_ids?: string[];
+  source_text?: string;
+  edited_documents?: EditedDocumentInput[];
+  options?: AuditOptions;
 }
 
 export interface SettingsConfig {

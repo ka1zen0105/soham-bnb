@@ -158,6 +158,7 @@ class AuditReport(BaseModel):
     claims: List[ClaimItem] = []
     summary: AuditSummary = AuditSummary()
     options: AuditOptions = AuditOptions()
+    parent_audit_id: Optional[str] = None
 
 class AuditListItem(BaseModel):
     id: str
@@ -171,6 +172,28 @@ class AuditListItem(BaseModel):
     ambiguous_count: int
     conflicting_count: int = 0
     source_doc_count: int
+    parent_audit_id: Optional[str] = None
+
+class AuditInputsResponse(BaseModel):
+    audit_id: str
+    title: str
+    answer_text: str
+    options: AuditOptions
+    source_documents: List[SourceDocument]
+    parent_audit_id: Optional[str] = None
+
+class EditedDocumentInput(BaseModel):
+    id: Optional[str] = None
+    filename: str
+    text: str
+
+class AuditRerunRequest(BaseModel):
+    title: Optional[str] = None
+    answer_text: str
+    source_document_ids: List[str] = []
+    source_text: Optional[str] = None
+    edited_documents: List[EditedDocumentInput] = []
+    options: Optional[AuditOptions] = None
 
 class SettingsConfig(BaseModel):
     gemini_api_key_configured: bool = False

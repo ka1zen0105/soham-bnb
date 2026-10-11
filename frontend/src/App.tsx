@@ -38,13 +38,13 @@ export function App() {
     topBarTitle = 'Audit workspace';
     pageContent = <DashboardPage navigate={navigate} />;
     isWhiteBg = false;
-  } else if (currentRoute === '/audit/new') {
+  } else if (currentRoute.startsWith('/audit/new')) {
     topBarTitle = 'New audit';
     breadcrumbs = [{ label: 'Workspace', href: '/' }];
     pageContent = <NewAuditPage navigate={navigate} />;
     isWhiteBg = false;
   } else if (currentRoute.startsWith('/audit/')) {
-    const auditId = currentRoute.replace('/audit/', '');
+    const auditId = currentRoute.split('?')[0].replace('/audit/', '');
     topBarTitle = 'Audit ledger';
     breadcrumbs = [
       { label: 'Workspace', href: '/' },

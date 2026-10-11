@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Upload, 
   FileText, 
@@ -8,9 +8,10 @@ import {
   AlertCircle, 
   FileCode, 
   BookOpen, 
-  Settings2
+  Settings2,
+  Copy
 } from 'lucide-react';
-import { uploadSourceFile, createAudit, fetchAudit, fetchDemoDataset } from '../services/api';
+import { uploadSourceFile, createAudit, fetchAudit, fetchDemoDataset, fetchAuditInputs } from '../services/api';
 import type { AuditOptions } from '../types';
 
 interface NewAuditPageProps {
@@ -46,6 +47,41 @@ export const NewAuditPage: React.FC<NewAuditPageProps> = ({ navigate }) => {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [activeStepText, setActiveStepText] = useState('');
   const [progressPct, setProgressPct] = useState(0);
+
+  const [fromAuditId, setFromAuditId] = useState<string | null>(null);
+
+  useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const fromId = params.get('from');
+      if (fromId) {
+        setFromAuditId(fromId);
+        fetchAuditInputs(fromId).then(inputs => {
+          setTitle(inputs.title ? `${inputs.title} (Copy)` : '');
+          setAnswerText(inputs.answer_text || '');
+          if (inputs.source_documents && inputs.source_documents.length > 0) {
+            setSourceMode('upload');
+            setUploadedDocs(
+              inputs.source_documents.map(d => ({
+                id: d.id,
+                filename: d.filename,
+                size_bytes: d.size_bytes,
+                page_count: d.page_count,
+                preview_snippet: d.extracted_text ? d.extracted_text.slice(0, 300) : ''
+              }))
+            );
+          }
+          if (inputs.options) {
+            setOptions(inputs.options);
+          }
+        }).catch(err => {
+          console.warn('Could not load source audit inputs:', err);
+        });
+      }
+    } catch {
+      // Ignore URL parsing errors
+    }
+  }, []);
 
   const wordCount = answerText.trim() ? answerText.trim().split(/\s+/).length : 0;
   const charCount = answerText.length;
@@ -179,6 +215,24 @@ export const NewAuditPage: React.FC<NewAuditPageProps> = ({ navigate }) => {
           </button>
         </div>
       </div>
+
+      {fromAuditId && (
+        <div className="bg-emerald-50 border border-emerald-200 text-emerald-900 px-4 py-3 rounded-[12px] text-[13px] flex items-center justify-between shadow-2xs">
+          <div className="flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+            <span>
+              Pre-filled from audit <strong className="font-mono">#{fromAuditId}</strong>. You can edit any inputs below and launch a new audit.
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => navigate(`/audit/${fromAuditId}`)}
+            className="text-emerald-700 hover:text-emerald-950 font-bold underline text-[12px]"
+          >
+            View original audit
+          </button>
+        </div>
+      )}
 
       {submitError && (
         <div className="p-4 bg-[var(--contradicted-tint)] border border-[var(--line)] rounded-[12px] text-[13px] text-[var(--contradicted-text)] flex items-center gap-2.5 font-medium">

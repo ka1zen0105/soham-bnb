@@ -1,4 +1,4 @@
-import type { AuditReport, AuditListItem, SettingsConfig, AuditOptions } from '../types';
+import type { AuditReport, AuditListItem, SettingsConfig, AuditOptions, AuditInputsResponse, AuditRerunRequest } from '../types';
 
 export const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
 
@@ -115,5 +115,27 @@ export async function fetchDemoDataset(demoId: string): Promise<{
 }> {
   const res = await fetch(`${API_BASE}/demo/${demoId}`);
   if (!res.ok) throw new Error('Failed to load demo dataset');
+  return res.json();
+}
+
+export async function fetchAuditInputs(auditId: string): Promise<AuditInputsResponse> {
+  const res = await fetch(`${API_BASE}/audits/${auditId}/inputs`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to fetch audit inputs' }));
+    throw new Error(err.detail || 'Failed to fetch audit inputs');
+  }
+  return res.json();
+}
+
+export async function rerunAudit(auditId: string, payload: AuditRerunRequest): Promise<AuditReport> {
+  const res = await fetch(`${API_BASE}/audits/${auditId}/rerun`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to re-run audit' }));
+    throw new Error(err.detail || 'Failed to re-run audit');
+  }
   return res.json();
 }

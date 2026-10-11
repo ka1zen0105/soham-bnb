@@ -12,7 +12,8 @@ import aiofiles
 
 from backend.models import (
     AuditCreateRequest, AuditReport, AuditStatusEnum, AuditListItem,
-    SourceDocument, ClaimItem, SettingsConfig, AuditSummary, AuditOptions, VerdictEnum
+    SourceDocument, ClaimItem, SettingsConfig, AuditSummary, AuditOptions, VerdictEnum,
+    AuditInputsResponse, AuditRerunRequest
 )
 from backend.document_processor import process_file, process_plain_text
 from backend.claim_extractor import extract_claims_deterministic
@@ -298,6 +299,87 @@ def get_audit_by_id(audit_id: str):
     if not report:
         raise HTTPException(status_code=404, detail=f"Audit with ID '{audit_id}' not found.")
     return report
+
+@app.get("/api/audits/{audit_id}/inputs", response_model=AuditInputsResponse)
+def get_audit_inputs(audit_id: str):
+    report = get_audit(audit_id)
+    if not report:
+        raise HTTPException(status_code=404, detail=f"Audit with ID '{audit_id}' not found.")
+    return AuditInputsResponse(
+        audit_id=report.id,
+        title=report.title,
+        answer_text=report.answer_text,
+        options=report.options,
+        source_documents=report.source_documents,
+        parent_audit_id=report.parent_audit_id
+    )
+
+@app.post("/api/audits/{audit_id}/rerun", response_model=AuditReport)
+async def rerun_audit(audit_id: str, request: AuditRerunRequest, background_tasks: BackgroundTasks):
+    parent = get_audit(audit_id)
+    if not parent:
+        raise HTTPException(status_code=404, detail=f"Audit with ID '{audit_id}' not found.")
+
+    if not request.answer_text.strip():
+        raise HTTPException(status_code=400, detail="AI-generated answer text is required.")
+
+    source_docs: List[SourceDocument] = []
+    parent_docs_map = {doc.id: doc for doc in parent.source_documents}
+
+    # 1. Retain kept documents by ID
+    for doc_id in request.source_document_ids:
+        doc = get_source_doc(doc_id) or parent_docs_map.get(doc_id)
+        if doc:
+            save_source_doc(doc)
+            source_docs.append(doc)
+
+    # 2. Add edited documents
+    for ed in request.edited_documents:
+        if ed.text and ed.text.strip():
+            doc = process_plain_text(ed.text.strip(), ed.filename or "Edited_Source_Document.txt")
+            save_source_doc(doc)
+            source_docs.append(doc)
+
+    # 3. Add newly pasted source text
+    if request.source_text and request.source_text.strip():
+        doc = process_plain_text(request.source_text.strip(), "Pasted_Source_Material.txt")
+        save_source_doc(doc)
+        source_docs.append(doc)
+
+    if not source_docs:
+        raise HTTPException(
+            status_code=400,
+            detail="Source material is required. Please keep or provide at least one source document."
+        )
+
+    new_audit_id = f"aud_{str(uuid.uuid4())[:10]}"
+    now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    title = request.title or parent.title
+    if not title or title.strip() == "Untitled Audit":
+        first_line = request.answer_text.strip().splitlines()[0][:60]
+        title = first_line if first_line else "Audit Review"
+
+    options = request.options or parent.options
+
+    new_report = AuditReport(
+        id=new_audit_id,
+        title=title,
+        created_at=now_str,
+        status=AuditStatusEnum.PENDING,
+        current_step="Audit queued...",
+        progress_percentage=0,
+        answer_text=request.answer_text,
+        source_documents=source_docs,
+        claims=[],
+        summary=AuditSummary(),
+        options=options,
+        parent_audit_id=audit_id
+    )
+
+    save_audit(new_report)
+    background_tasks.add_task(execute_audit_pipeline, new_audit_id)
+    return new_report
 
 @app.delete("/api/audits/{audit_id}")
 def delete_audit_by_id(audit_id: str):

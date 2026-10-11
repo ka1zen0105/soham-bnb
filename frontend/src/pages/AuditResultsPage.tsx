@@ -13,11 +13,15 @@ import {
   Info,
   FileText,
   LayoutGrid,
-  Table as TableIcon
+  Table as TableIcon,
+  RotateCcw,
+  FileEdit,
+  Plus
 } from 'lucide-react';
-import type { AuditReport, ClaimItem, EvidenceQuote, Verdict } from '../types';
-import { fetchAudit, API_BASE } from '../services/api';
+import type { AuditReport, ClaimItem, EvidenceQuote, Verdict, AuditInputsResponse } from '../types';
+import { fetchAudit, fetchAuditInputs, API_BASE } from '../services/api';
 import { getVerdictStyle } from '../lib/verdict';
+import { EditInputsDrawer } from '../components/EditInputsDrawer';
 
 interface AuditResultsPageProps {
   auditId: string;
@@ -28,6 +32,32 @@ export const AuditResultsPage: React.FC<AuditResultsPageProps> = ({ auditId, nav
   const [report, setReport] = useState<AuditReport | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+  const [drawerSection, setDrawerSection] = useState<'target' | 'source'>('target');
+  const [inputsData, setInputsData] = useState<AuditInputsResponse | null>(null);
+
+  const handleOpenDrawer = async (section: 'target' | 'source' = 'target') => {
+    setDrawerSection(section);
+    setIsDrawerOpen(true);
+    if (!inputsData) {
+      try {
+        const data = await fetchAuditInputs(auditId);
+        setInputsData(data);
+      } catch {
+        if (report) {
+          setInputsData({
+            audit_id: report.id,
+            title: report.title,
+            answer_text: report.answer_text,
+            options: report.options,
+            source_documents: report.source_documents,
+            parent_audit_id: report.parent_audit_id
+          });
+        }
+      }
+    }
+  };
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [layout, setLayout] = useState<'deck' | 'table'>('deck');
@@ -315,6 +345,88 @@ export const AuditResultsPage: React.FC<AuditResultsPageProps> = ({ auditId, nav
         )}
       </header>
 
+      {/* ══ 1.5 INPUTS BAR ═════════════════════════════════════════════════ */}
+      <section className="border-t border-b border-[#E8EAEE] bg-[#F7F8F6] px-6 lg:px-10 py-3 flex flex-col md:flex-row md:items-center md:justify-between gap-3 text-[13px]">
+        {/* Left: Summary + Source chips */}
+        <div className="flex items-center gap-3 flex-wrap min-w-0">
+          <div className="flex items-center gap-1.5 font-bold text-[var(--ink)] shrink-0">
+            <FileText className="w-4 h-4 text-[#12C56E]" />
+            <span>Audited text:</span>
+            <span className="font-mono font-semibold text-[var(--text-secondary)]">
+              {report.answer_text.trim() ? report.answer_text.trim().split(/\s+/).length : 0} words
+            </span>
+          </div>
+
+          <span className="text-[#D0D5DD] hidden sm:inline">|</span>
+
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="text-[var(--text-secondary)] font-medium text-[12px]">Sources:</span>
+            {report.source_documents && report.source_documents.length > 0 ? (
+              report.source_documents.map(doc => (
+                <button
+                  key={doc.id}
+                  type="button"
+                  onClick={() => handleOpenDrawer('source')}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-[6px] bg-white border border-[#E8EAEE] text-[12px] font-mono text-[var(--ink)] hover:border-[#12C56E] transition-colors shadow-2xs"
+                  title="Click to view or edit this source in the drawer"
+                >
+                  <span className="truncate max-w-[170px] font-semibold">{doc.filename}</span>
+                  <span className="text-[var(--text-secondary)] text-[11px]">
+                    ({doc.page_count} page{doc.page_count !== 1 ? 's' : ''})
+                  </span>
+                </button>
+              ))
+            ) : (
+              <span className="text-[var(--text-secondary)] italic text-[12px]">Reference text</span>
+            )}
+          </div>
+
+          {report.parent_audit_id && (
+            <>
+              <span className="text-[#D0D5DD] hidden sm:inline">|</span>
+              <button
+                type="button"
+                onClick={() => navigate(`/audit/${report.parent_audit_id}`)}
+                className="text-[12px] font-bold text-[#12C56E] hover:underline flex items-center gap-1"
+                title={`Navigate to previous audit run #${report.parent_audit_id}`}
+              >
+                <span>Edited from audit #{report.parent_audit_id}</span>
+              </button>
+            </>
+          )}
+        </div>
+
+        {/* Right: Actions */}
+        <div className="flex items-center gap-2.5 shrink-0 self-start md:self-auto">
+          <button
+            type="button"
+            onClick={() => navigate(`/audit/new?from=${report.id}`)}
+            className="text-[12px] font-semibold text-[var(--text-secondary)] hover:text-[var(--ink)] px-2.5 py-1.5 rounded-[8px] hover:bg-white transition-colors"
+            title="Open full editor page pre-filled with this audit's inputs"
+          >
+            Back to editor
+          </button>
+
+          <button
+            type="button"
+            onClick={() => handleOpenDrawer('target')}
+            className="px-3.5 py-1.5 bg-[#12C56E] hover:bg-[#0fa95d] text-white text-[12px] font-bold rounded-[8px] shadow-xs flex items-center gap-1.5 transition-colors"
+          >
+            <FileEdit className="w-3.5 h-3.5" />
+            <span>Edit inputs</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => handleOpenDrawer('target')}
+            className="px-3.5 py-1.5 bg-white border border-[#E8EAEE] hover:bg-[#F2F4F7] text-[var(--ink)] text-[12px] font-bold rounded-[8px] shadow-2xs flex items-center gap-1.5 transition-colors"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>Re-run</span>
+          </button>
+        </div>
+      </section>
+
       {/* ══ 2. DECK VIEW ═══════════════════════════════════════════════════ */}
       {layout === 'deck' && (
         <div className="flex flex-col lg:flex-row flex-1 overflow-hidden">
@@ -569,29 +681,41 @@ export const AuditResultsPage: React.FC<AuditResultsPageProps> = ({ auditId, nav
                 {/* TAB 2: In context (full original answer with sentence click or diff) */}
                 {activeTab === 'context' && (
                   <div className="space-y-4 pt-1">
-                    {/* Header bar: instruction on left, View/Diff on right */}
+                    {/* Header bar: instruction on left, Edit shortcut and View/Diff on right */}
                     <div className="flex items-center justify-between pb-2 border-b border-[var(--line-soft)]">
                       <span className="text-[12px] text-[var(--text-secondary)] font-medium">
                         Click highlighted text to select a claim
                       </span>
 
-                      <div className="bg-[#F2F4F7] p-[2px] rounded-[8px] flex items-center gap-1">
+                      <div className="flex items-center gap-2">
                         <button
-                          onClick={() => setContextMode('view')}
-                          className={`px-2.5 py-1 text-[11px] font-bold rounded-[6px] transition-colors ${
-                            contextMode === 'view' ? 'bg-white text-[var(--ink)] shadow-xs' : 'text-[var(--text-secondary)]'
-                          }`}
+                          type="button"
+                          onClick={() => handleOpenDrawer('target')}
+                          className="text-[11px] font-bold text-[#12C56E] hover:underline flex items-center gap-1 px-2 py-1 rounded-[6px] hover:bg-[#F2F4F7] transition-colors"
+                          title="Edit audited text in the drawer"
                         >
-                          View
+                          <FileEdit className="w-3.5 h-3.5" />
+                          <span>Edit</span>
                         </button>
-                        <button
-                          onClick={() => setContextMode('diff')}
-                          className={`px-2.5 py-1 text-[11px] font-bold rounded-[6px] transition-colors ${
-                            contextMode === 'diff' ? 'bg-white text-[var(--ink)] shadow-xs' : 'text-[var(--text-secondary)]'
-                          }`}
-                        >
-                          Diff
-                        </button>
+
+                        <div className="bg-[#F2F4F7] p-[2px] rounded-[8px] flex items-center gap-1">
+                          <button
+                            onClick={() => setContextMode('view')}
+                            className={`px-2.5 py-1 text-[11px] font-bold rounded-[6px] transition-colors ${
+                              contextMode === 'view' ? 'bg-white text-[var(--ink)] shadow-xs' : 'text-[var(--text-secondary)]'
+                            }`}
+                          >
+                            View
+                          </button>
+                          <button
+                            onClick={() => setContextMode('diff')}
+                            className={`px-2.5 py-1 text-[11px] font-bold rounded-[6px] transition-colors ${
+                              contextMode === 'diff' ? 'bg-white text-[var(--ink)] shadow-xs' : 'text-[var(--text-secondary)]'
+                            }`}
+                          >
+                            Diff
+                          </button>
+                        </div>
                       </div>
                     </div>
 
@@ -661,12 +785,23 @@ export const AuditResultsPage: React.FC<AuditResultsPageProps> = ({ auditId, nav
                 {/* TAB 3: Source file */}
                 {activeTab === 'source' && (
                   <div className="space-y-4 pt-1">
-                    <div className="flex items-center gap-2 text-[13px] font-mono font-bold text-[var(--ink)]">
-                      <FileText className="w-4 h-4 text-[var(--accent-text)]" />
-                      <span>{report.source_documents?.[0]?.filename || 'Primary_Source.txt'}</span>
-                      <span className="text-[12px] text-[var(--text-secondary)] font-normal">
-                        · Matched passages for this claim
-                      </span>
+                    <div className="flex items-center justify-between pb-2 border-b border-[var(--line-soft)]">
+                      <div className="flex items-center gap-2 text-[13px] font-mono font-bold text-[var(--ink)]">
+                        <FileText className="w-4 h-4 text-[var(--accent-text)]" />
+                        <span>{report.source_documents?.[0]?.filename || 'Primary_Source.txt'}</span>
+                        <span className="text-[12px] text-[var(--text-secondary)] font-normal">
+                          · Matched passages
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleOpenDrawer('source')}
+                        className="text-[11px] font-bold text-[#12C56E] hover:underline flex items-center gap-1 px-2 py-1 rounded-[6px] hover:bg-[#F2F4F7] transition-colors"
+                        title="Edit primary source documents in the drawer"
+                      >
+                        <FileEdit className="w-3.5 h-3.5" />
+                        <span>Edit sources</span>
+                      </button>
                     </div>
 
                     {allEvidence.length === 0 ? (
@@ -846,6 +981,23 @@ export const AuditResultsPage: React.FC<AuditResultsPageProps> = ({ auditId, nav
           </div>
         </div>
       )}
+
+      {/* ══ 4. EDIT INPUTS DRAWER ════════════════════════════════════════ */}
+      <EditInputsDrawer
+        isOpen={isDrawerOpen}
+        onClose={() => setIsDrawerOpen(false)}
+        auditId={auditId}
+        initialInputs={inputsData || (report ? {
+          audit_id: report.id,
+          title: report.title,
+          answer_text: report.answer_text,
+          options: report.options,
+          source_documents: report.source_documents,
+          parent_audit_id: report.parent_audit_id
+        } : null)}
+        initialSection={drawerSection}
+        navigate={navigate}
+      />
 
     </div>
   );

@@ -43,6 +43,10 @@ def init_db():
         cursor.execute("ALTER TABLE audits ADD COLUMN conflicting_count INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass
+    try:
+        cursor.execute("ALTER TABLE audits ADD COLUMN parent_audit_id TEXT")
+    except sqlite3.OperationalError:
+        pass
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS source_docs (
             id TEXT PRIMARY KEY,
@@ -114,6 +118,7 @@ def list_audits() -> List[AuditListItem]:
     items = []
     for r in rows:
         conflicting = r["conflicting_count"] if "conflicting_count" in r.keys() else 0
+        parent_id = r["parent_audit_id"] if "parent_audit_id" in r.keys() else None
         items.append(AuditListItem(
             id=r["id"],
             title=r["title"],
@@ -125,7 +130,8 @@ def list_audits() -> List[AuditListItem]:
             insufficient_count=r["insufficient_count"],
             ambiguous_count=r["ambiguous_count"],
             conflicting_count=conflicting,
-            source_doc_count=r["source_doc_count"]
+            source_doc_count=r["source_doc_count"],
+            parent_audit_id=parent_id
         ))
     return items
 
