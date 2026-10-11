@@ -1,6 +1,6 @@
 import re
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from backend.models import ClaimItem, VerdictEnum, ClaimCategoryEnum, SeverityEnum
 
 from backend.text_normalizer import sentences, strip_footnote_markers
@@ -88,105 +88,147 @@ def split_claims_into_atomic(claims: List[ClaimItem]) -> List[ClaimItem]:
                 claim_idx += 1
     return atomic
 
+COMMON_SUFFIXES = {
+    'tion', 'tions', 'sion', 'sions', 'chitectures', 'chitecture', 
+    'tures', 'ture', 'ment', 'ments', 'able', 'ible', 'ity', 'ities',
+    'ness', 'nesses', 'fully', 'ful', 'ing', 'ings', 'ism', 'isms',
+    'ist', 'ists', 'ize', 'ized', 'izing', 'ise', 'ised', 'ising',
+    'ally', 'ology', 'ological', 'ical', 'ic', 'ized', 'ance', 'ence',
+    'ly', 'ers', 'er', 'est'
+}
+
+COMMON_PREFIX_FRAGMENTS = {
+    'ar', 'organiza', 'implemen', 'configura', 'discrep', 'concen', 
+    'infrap', 'experi', 'signifi', 'fundamen', 'infeasi'
+}
+
+def unwrap_text_into_blocks(text: str) -> List[Tuple[str, str]]:
+    """
+    Groups raw text into coherent semantic blocks (paragraphs or bullet points),
+    healing soft line-wraps and hyphenated/broken words (e.g. from PDF copy-paste),
+    while preserving genuine bullet points and paragraph breaks.
+    Returns list of (block_type, block_text) tuples where block_type is 'bullet' or 'prose'.
+    """
+    raw_blocks = re.split(r'\n\s*\n', text)
+    processed_items: List[Tuple[str, str]] = []
+    
+    for block in raw_blocks:
+        block = block.strip()
+        if not block:
+            continue
+            
+        lines = block.splitlines()
+        current_lines: List[str] = []
+        is_bullet = False
+        
+        for raw_line in lines:
+            line_str = raw_line.strip()
+            if not line_str or (line_str.startswith('#') and len(line_str.split()) < 3):
+                continue
+                
+            bullet_match = re.match(r'^([-*•]|\d+\.)\s+(.+)$', line_str)
+            if bullet_match:
+                if current_lines:
+                    processed_items.append(('bullet' if is_bullet else 'prose', ' '.join(current_lines)))
+                    current_lines = []
+                is_bullet = True
+                current_lines.append(bullet_match.group(2).strip())
+            else:
+                if not current_lines:
+                    is_bullet = False
+                    current_lines.append(line_str)
+                else:
+                    prev = current_lines[-1]
+                    # Case 1: Line ended with hyphen: e.g. organiza- or ar-
+                    if prev.endswith('-'):
+                        stem = prev[:-1].rstrip()
+                        w1_m = re.search(r'[A-Za-z]+$', stem)
+                        w2_m = re.match(r'^[A-Za-z]+', line_str)
+                        if w1_m and w2_m:
+                            w1, w2 = w1_m.group(), w2_m.group()
+                            if w2.lower() in COMMON_SUFFIXES or w1.lower() in COMMON_PREFIX_FRAGMENTS:
+                                current_lines[-1] = stem[:w1_m.start()] + w1 + w2 + line_str[w2_m.end():]
+                            else:
+                                current_lines[-1] = stem + '-' + line_str
+                        else:
+                            current_lines[-1] = stem + '-' + line_str
+                    else:
+                        # Case 2: Line ended without hyphen but words were split across line break (organiza / tion, ar / chitectures)
+                        w1_m = re.search(r'[A-Za-z]+$', prev)
+                        w2_m = re.match(r'^[A-Za-z]+', line_str)
+                        if w1_m and w2_m and (w2_m.group().lower() in COMMON_SUFFIXES or w1_m.group().lower() in COMMON_PREFIX_FRAGMENTS):
+                            w1, w2 = w1_m.group(), w2_m.group()
+                            current_lines[-1] = prev[:w1_m.start()] + w1 + w2 + line_str[w2_m.end():]
+                        else:
+                            current_lines.append(line_str)
+                            
+        if current_lines:
+            processed_items.append(('bullet' if is_bullet else 'prose', ' '.join(current_lines)))
+            
+    return processed_items
+
 def extract_claims_deterministic(answer_text: str) -> List[ClaimItem]:
     """
     Extract atomic claims deterministically from answer text, splitting into
-    single-sentence atomic claims before verification and preserving character positions.
+    single-sentence atomic claims before verification, healing soft line-wraps
+    and word fragmentation, and preserving character positions.
     """
     claims: List[ClaimItem] = []
     if not answer_text.strip():
         return claims
 
     claim_idx = 1
-    lines = answer_text.splitlines(keepends=True)
-    char_cursor = 0
+    blocks = unwrap_text_into_blocks(answer_text)
 
-    for line in lines:
-        line_len = len(line)
-        stripped = line.strip()
-        
-        # Skip empty lines, headers without assertions, or trivial greetings
-        if not stripped or (stripped.startswith('#') and len(stripped.split()) < 3):
-            char_cursor += line_len
-            continue
-            
-        # Check for bullet point
-        bullet_match = re.match(r'^\s*([-*•]|\d+\.)\s*(.+)$', line)
-        if bullet_match:
-            bullet_content = bullet_match.group(2).strip()
-            # Split bullet into discrete single-sentence atomic claims
-            sents = sentences(bullet_content)
-            for s_clean in sents:
-                if len(s_clean) < 10:
-                    continue
-                pos = answer_text.find(s_clean, char_cursor)
-                start_off = pos if pos != -1 else char_cursor
-                end_off = start_off + len(s_clean)
-                
-                cat = categorize_claim(s_clean)
-                claims.append(ClaimItem(
-                    id=f"clm_{claim_idx}",
-                    claim_number=claim_idx,
-                    text=s_clean,
-                    start_offset=start_off,
-                    end_offset=end_off,
-                    verdict=VerdictEnum.INSUFFICIENT_EVIDENCE,
-                    category=cat,
-                    explanation="",
-                    supporting_evidence=[],
-                    contradicting_evidence=[],
-                    confidence_score=0.0,
-                    confidence_basis="",
-                    severity=SeverityEnum.MEDIUM if cat == ClaimCategoryEnum.NUMERICAL else (
-                        SeverityEnum.HIGH if cat == ClaimCategoryEnum.SAFETY else SeverityEnum.LOW
-                    ),
-                    sub_claims=[]
-                ))
-                claim_idx += 1
-        else:
-            # Regular prose paragraph: split into discrete single-sentence atomic claims
-            sents = sentences(stripped)
-            for s_clean in sents:
-                if len(s_clean) < 12:
-                    continue
-                pos = answer_text.find(s_clean, char_cursor)
-                start_off = pos if pos != -1 else char_cursor
-                end_off = start_off + len(s_clean)
+    for block_type, block_text in blocks:
+        sents = sentences(block_text)
+        for s_clean in sents:
+            s_clean = s_clean.strip()
+            if len(s_clean) < 10:
+                continue
 
-                cat = categorize_claim(s_clean)
-                claims.append(ClaimItem(
-                    id=f"clm_{claim_idx}",
-                    claim_number=claim_idx,
-                    text=s_clean,
-                    start_offset=start_off,
-                    end_offset=end_off,
-                    verdict=VerdictEnum.INSUFFICIENT_EVIDENCE,
-                    category=cat,
-                    explanation="",
-                    supporting_evidence=[],
-                    contradicting_evidence=[],
-                    confidence_score=0.0,
-                    confidence_basis="",
-                    severity=SeverityEnum.MEDIUM if cat == ClaimCategoryEnum.NUMERICAL else (
-                        SeverityEnum.HIGH if cat == ClaimCategoryEnum.SAFETY else SeverityEnum.LOW
-                    ),
-                    sub_claims=[]
-                ))
-                claim_idx += 1
+            words = s_clean.split()
+            first_phrase = " ".join(words[:min(4, len(words))])
+            pos = answer_text.find(first_phrase)
+            if pos != -1:
+                start_off = pos
+                last_phrase = " ".join(words[max(0, len(words)-3):])
+                end_pos = answer_text.find(last_phrase, start_off)
+                end_off = (end_pos + len(last_phrase)) if end_pos != -1 else (start_off + len(s_clean))
+            else:
+                start_off = 0
+                end_off = len(s_clean)
 
-        char_cursor += line_len
+            cat = categorize_claim(s_clean)
+            claims.append(ClaimItem(
+                id=f"clm_{claim_idx}",
+                claim_number=claim_idx,
+                text=s_clean,
+                start_offset=start_off,
+                end_offset=end_off,
+                verdict=VerdictEnum.INSUFFICIENT_EVIDENCE,
+                category=cat,
+                explanation="",
+                supporting_evidence=[],
+                contradicting_evidence=[],
+                confidence_score=0.0,
+                confidence_basis="",
+                severity=SeverityEnum.MEDIUM if cat == ClaimCategoryEnum.NUMERICAL else (
+                    SeverityEnum.HIGH if cat == ClaimCategoryEnum.SAFETY else SeverityEnum.LOW
+                ),
+                sub_claims=[]
+            ))
+            claim_idx += 1
 
-    # If no claims parsed (e.g. single sentence without standard punctuation), use full text
     if not claims and answer_text.strip():
         text_clean = answer_text.strip()
-        pos = answer_text.find(text_clean)
         cat = categorize_claim(text_clean)
         claims.append(ClaimItem(
             id="clm_1",
             claim_number=1,
             text=text_clean,
-            start_offset=pos if pos != -1 else 0,
-            end_offset=(pos + len(text_clean)) if pos != -1 else len(answer_text),
+            start_offset=0,
+            end_offset=len(text_clean),
             verdict=VerdictEnum.INSUFFICIENT_EVIDENCE,
             category=cat,
             explanation="",

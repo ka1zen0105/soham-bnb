@@ -157,6 +157,24 @@ class TestVadaPavVerification(unittest.TestCase):
         self.assertEqual(claims[0].category, ClaimCategoryEnum.FACTUAL)
         self.assertEqual(claims[1].category, ClaimCategoryEnum.FACTUAL)
 
+    def test_soft_wrap_and_split_words_unwrapping(self):
+        """Verify that line-wrapped and split words (e.g. from PDF copy-paste) are unwrapped into full assertions."""
+        wrapped_text = (
+            "Public code repositories such as GitHub offer a wide range\n"
+            "of programming examples; however, they often fail to reflect\n"
+            "the internal conventions, documentation styles, and system ar\n"
+            "chitectures characteristic of proprietary or enterprise-level code.\n"
+            "In real-world hardware development, each organiza\n"
+            "tion typically maintains code with a unique structure, domain\n"
+            "specific APIs, and customized business logic."
+        )
+        claims = extract_claims_deterministic(wrapped_text)
+        self.assertEqual(len(claims), 2)
+        self.assertIn("system architectures", claims[0].text)
+        self.assertIn("each organization", claims[1].text)
+        self.assertFalse(any(c.text.strip().endswith("system ar") for c in claims))
+        self.assertFalse(any(c.text.strip().startswith("tion") for c in claims))
+
     def test_quote_validation_accepts_normalized_substring_and_high_similarity(self):
         """Quote validation must compare normalised text, accepting substring or similarity > 0.9."""
         source_p = "Vada pav, alternatively spelt wada pao, (listen ⓘ) is a vegetarian fast food dish native to the Indian state of Maharashtra.[1]"
