@@ -16,7 +16,7 @@ import {
   Table as TableIcon
 } from 'lucide-react';
 import type { AuditReport, ClaimItem, EvidenceQuote, Verdict } from '../types';
-import { fetchAudit } from '../services/api';
+import { fetchAudit, API_BASE } from '../services/api';
 import { getVerdictStyle } from '../lib/verdict';
 
 interface AuditResultsPageProps {
@@ -293,7 +293,7 @@ export const AuditResultsPage: React.FC<AuditResultsPageProps> = ({ auditId, nav
 
             {/* Export button */}
             <a
-              href={`/api/audits/${report.id}/export/markdown`}
+              href={`${API_BASE}/audits/${report.id}/export/markdown`}
               download
               className="h-[38px] px-3.5 border border-[var(--line)] rounded-[10px] bg-white text-[var(--ink)] hover:bg-[var(--surface-hover)] text-[12px] font-bold inline-flex items-center gap-2 transition-colors"
               title="Download audit as Markdown"
