@@ -24,7 +24,7 @@ export async function saveSettings(payload: Partial<SettingsConfig> & { gemini_a
   return res.json();
 }
 
-export async function uploadSourceFile(file: File): Promise<{
+export interface UploadedDocResponse {
   id: string;
   filename: string;
   file_type: string;
@@ -32,7 +32,11 @@ export async function uploadSourceFile(file: File): Promise<{
   page_count: number;
   passage_count: number;
   preview_snippet: string;
-}> {
+  warnings?: string[];
+  units?: any[];
+}
+
+export async function uploadSourceFile(file: File): Promise<UploadedDocResponse> {
   const formData = new FormData();
   formData.append('file', file);
   const res = await fetch(`${API_BASE}/sources/upload`, {
@@ -46,15 +50,7 @@ export async function uploadSourceFile(file: File): Promise<{
   return res.json();
 }
 
-export async function pasteSourceText(text: string, filename?: string): Promise<{
-  id: string;
-  filename: string;
-  file_type: string;
-  size_bytes: number;
-  page_count: number;
-  passage_count: number;
-  preview_snippet: string;
-}> {
+export async function pasteSourceText(text: string, filename?: string): Promise<UploadedDocResponse> {
   const res = await fetch(`${API_BASE}/sources/paste`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -67,11 +63,44 @@ export async function pasteSourceText(text: string, filename?: string): Promise<
   return res.json();
 }
 
+export async function fetchPaperByDoiOrUrl(query: string): Promise<UploadedDocResponse> {
+  const res = await fetch(`${API_BASE}/sources/fetch_paper`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to fetch paper' }));
+    throw new Error(err.detail || 'Failed to fetch paper');
+  }
+  return res.json();
+}
+
+export async function ingestPreParsedUnits(
+  name: string,
+  type: string,
+  units: any[],
+  warnings?: string[],
+  meta?: any
+): Promise<UploadedDocResponse> {
+  const res = await fetch(`${API_BASE}/sources/units`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, type, units, warnings, meta })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to ingest units' }));
+    throw new Error(err.detail || 'Failed to ingest units');
+  }
+  return res.json();
+}
+
 export async function createAudit(payload: {
   title?: string;
   answer_text: string;
   source_text?: string;
   source_document_ids?: string[];
+  source_documents_data?: Array<{ id: string; filename: string; text?: string; preview_snippet?: string }>;
   options?: AuditOptions;
 }): Promise<AuditReport> {
   const res = await fetch(`${API_BASE}/audits`, {

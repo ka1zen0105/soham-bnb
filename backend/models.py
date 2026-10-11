@@ -37,6 +37,13 @@ class AuditStatusEnum(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 
+class TextUnit(BaseModel):
+    index: int = 1
+    label: str = "Page 1"
+    text: str
+    unit_type: Optional[str] = "body"
+    is_ocr: Optional[bool] = False
+
 class Passage(BaseModel):
     id: str
     source_id: str
@@ -46,6 +53,10 @@ class Passage(BaseModel):
     text: str
     char_start: int
     char_end: int
+    unit_index: Optional[int] = 1
+    unit_label: Optional[str] = None
+    unit_type: Optional[str] = "body"
+    is_ocr: bool = False
 
 class SourceDocument(BaseModel):
     id: str
@@ -57,6 +68,9 @@ class SourceDocument(BaseModel):
     passage_count: int
     passages: List[Passage] = []
     source_url: Optional[str] = None
+    units: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    meta: Dict[str, Any] = {}
 
 class EvidenceQuote(BaseModel):
     id: str
@@ -75,6 +89,9 @@ class EvidenceQuote(BaseModel):
     context_before: Optional[str] = ""
     context_after: Optional[str] = ""
     extraction_error: Optional[str] = None
+    unit_label: Optional[str] = None
+    unit_type: Optional[str] = "body"
+    is_ocr: bool = False
 
 class NumericalDiscrepancy(BaseModel):
     has_discrepancy: bool = False
@@ -115,6 +132,7 @@ class ClaimItem(BaseModel):
     safety_issues: List[SafetyIssue] = []
     sub_claims: List[Dict[str, Any]] = []
     provenance_audit: Optional[Dict[str, Any]] = None
+    is_ocr_supported: bool = False
 
 class AuditSummary(BaseModel):
     total_claims: int = 0
@@ -143,6 +161,7 @@ class AuditCreateRequest(BaseModel):
     answer_text: str
     source_text: Optional[str] = None
     source_document_ids: List[str] = []
+    source_documents_data: Optional[List[Dict[str, Any]]] = []
     options: AuditOptions = AuditOptions()
 
 class AuditReport(BaseModel):
@@ -194,6 +213,16 @@ class AuditRerunRequest(BaseModel):
     source_text: Optional[str] = None
     edited_documents: List[EditedDocumentInput] = []
     options: Optional[AuditOptions] = None
+
+class UnitsIngestRequest(BaseModel):
+    name: str
+    type: Optional[str] = "text/plain"
+    units: List[Dict[str, Any]]
+    meta: Optional[Dict[str, Any]] = {}
+    warnings: Optional[List[str]] = []
+
+class PaperFetchRequest(BaseModel):
+    query: str
 
 class SettingsConfig(BaseModel):
     gemini_api_key_configured: bool = False

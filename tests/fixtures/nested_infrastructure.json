@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "environment": "production",
+    "version": "2.4.0"
+  },
+  "infrastructure": {
+    "datacenter": {
+      "cluster": {
+        "primary_region": "us-east-1",
+        "node_count": 128,
+        "hypervisor": "KVM"
+      }
+    }
+  }
+}

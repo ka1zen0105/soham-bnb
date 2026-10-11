@@ -13,9 +13,10 @@ import aiofiles
 from backend.models import (
     AuditCreateRequest, AuditReport, AuditStatusEnum, AuditListItem,
     SourceDocument, ClaimItem, SettingsConfig, AuditSummary, AuditOptions, VerdictEnum,
-    AuditInputsResponse, AuditRerunRequest
+    AuditInputsResponse, AuditRerunRequest, UnitsIngestRequest, PaperFetchRequest
 )
-from backend.document_processor import process_file, process_plain_text
+from backend.document_processor import process_file, process_plain_text, create_source_document_from_units
+from backend.paper_fetcher import fetch_paper_from_query
 from backend.claim_extractor import extract_claims_deterministic
 from backend.evidence_retriever import BM25Retriever
 from backend.claim_verifier import verify_single_claim
@@ -73,7 +74,7 @@ async def execute_audit_pipeline(audit_id: str):
         report.current_step = "Processing and indexing source documents..."
         report.progress_percentage = 15
         save_audit(report)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0)
 
         all_passages = []
         for doc in report.source_documents:
@@ -90,7 +91,7 @@ async def execute_audit_pipeline(audit_id: str):
         report.current_step = "Extracting discrete atomic assertions and offsets..."
         report.progress_percentage = 35
         save_audit(report)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0)
 
         raw_claims = extract_claims_deterministic(report.answer_text)
         from backend.claim_extractor import split_claims_into_atomic
@@ -106,7 +107,7 @@ async def execute_audit_pipeline(audit_id: str):
         report.current_step = f"Indexing {len(all_passages)} passages across {len(report.source_documents)} source document(s)..."
         report.progress_percentage = 55
         save_audit(report)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0)
 
         retriever = BM25Retriever(all_passages)
 
@@ -127,7 +128,7 @@ async def execute_audit_pipeline(audit_id: str):
             report.progress_percentage = min(90, step_progress)
             report.current_step = f"Verified claim {idx + 1} of {len(raw_claims)}: [{v_claim.verdict.value}]"
             save_audit(report)
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0)
 
         # Stage 5: Preparing report
         report.status = AuditStatusEnum.PREPARING_REPORT
@@ -141,7 +142,7 @@ async def execute_audit_pipeline(audit_id: str):
         report = validate_audit_report(report)
         
         save_audit(report)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0)
 
         # Complete!
         report.status = AuditStatusEnum.COMPLETED
@@ -183,14 +184,6 @@ def update_settings(payload: dict):
 @app.post("/api/sources/upload")
 async def upload_source_file(file: UploadFile = File(...)):
     filename = file.filename or "uploaded_file"
-    ext = os.path.splitext(filename)[1].lower()
-    
-    if ext not in [".pdf", ".docx", ".doc", ".pptx", ".txt", ".md", ".json", ".csv"]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file format '{ext}'. Second Opinion supports PDF, DOCX, PPTX, and TXT/MD files."
-        )
-
     file_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}_{filename}")
     try:
         async with aiofiles.open(file_path, "wb") as out_file:
@@ -207,7 +200,9 @@ async def upload_source_file(file: UploadFile = File(...)):
             "size_bytes": doc.size_bytes,
             "page_count": doc.page_count,
             "passage_count": doc.passage_count,
-            "preview_snippet": doc.extracted_text[:400] + ("..." if len(doc.extracted_text) > 400 else "")
+            "preview_snippet": doc.extracted_text[:400] + ("..." if len(doc.extracted_text) > 400 else ""),
+            "warnings": doc.warnings,
+            "units": doc.units[:100]
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -218,6 +213,58 @@ async def upload_source_file(file: UploadFile = File(...)):
                 os.remove(file_path)
             except Exception:
                 pass
+
+@app.post("/api/sources/units")
+def ingest_source_units(payload: UnitsIngestRequest):
+    source_id = str(uuid.uuid4())[:8]
+    doc = create_source_document_from_units(
+        source_id=source_id,
+        name=payload.name,
+        file_type=payload.type or "text/plain",
+        units=payload.units,
+        warnings=payload.warnings or [],
+        meta=payload.meta or {}
+    )
+    save_source_doc(doc)
+    return {
+        "id": doc.id,
+        "filename": doc.filename,
+        "file_type": doc.file_type,
+        "size_bytes": doc.size_bytes,
+        "page_count": doc.page_count,
+        "passage_count": doc.passage_count,
+        "preview_snippet": doc.extracted_text[:400] + ("..." if len(doc.extracted_text) > 400 else ""),
+        "warnings": doc.warnings,
+        "units": doc.units[:100]
+    }
+
+@app.post("/api/sources/fetch_paper")
+def fetch_paper_source(payload: PaperFetchRequest):
+    try:
+        res = fetch_paper_from_query(payload.query)
+        source_id = str(uuid.uuid4())[:8]
+        doc = create_source_document_from_units(
+            source_id=source_id,
+            name=res["name"],
+            file_type=res.get("type", "application/x-paper"),
+            units=res["units"],
+            warnings=res.get("warnings", []),
+            meta=res.get("meta", {})
+        )
+        save_source_doc(doc)
+        return {
+            "id": doc.id,
+            "filename": doc.filename,
+            "file_type": doc.file_type,
+            "size_bytes": doc.size_bytes,
+            "page_count": doc.page_count,
+            "passage_count": doc.passage_count,
+            "preview_snippet": doc.extracted_text[:400] + ("..." if len(doc.extracted_text) > 400 else ""),
+            "warnings": doc.warnings,
+            "units": doc.units[:100]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/sources/paste")
 def paste_source_text(payload: dict):
@@ -235,11 +282,18 @@ def paste_source_text(payload: dict):
         "size_bytes": doc.size_bytes,
         "page_count": doc.page_count,
         "passage_count": doc.passage_count,
-        "preview_snippet": doc.extracted_text[:400] + ("..." if len(doc.extracted_text) > 400 else "")
+        "preview_snippet": doc.extracted_text[:400] + ("..." if len(doc.extracted_text) > 400 else ""),
+        "warnings": doc.warnings,
+        "units": doc.units[:100]
     }
 
 @app.post("/api/audits", response_model=AuditReport)
-async def create_audit(request: AuditCreateRequest, background_tasks: BackgroundTasks):
+async def create_audit(request: AuditCreateRequest, background_tasks: BackgroundTasks = BackgroundTasks()):
+    # NOTE: SQLite is not persistent on Vercel serverless functions across requests.
+    # Each serverless invocation runs in an ephemeral instance. We execute the audit
+    # pipeline synchronously before returning so that the complete audit result
+    # (claims, verdicts, evidence, metrics, original text, source documents) is
+    # guaranteed to be returned in the response payload.
     if not request.answer_text.strip():
         raise HTTPException(status_code=400, detail="AI-generated answer text is required.")
 
@@ -256,6 +310,20 @@ async def create_audit(request: AuditCreateRequest, background_tasks: Background
         doc = get_source_doc(doc_id)
         if doc:
             source_docs.append(doc)
+
+    # Resilient fallback: If SQLite didn't have the doc (e.g. Vercel instance changed),
+    # but the frontend sent source_documents_data, reconstruct them immediately:
+    if request.source_documents_data:
+        for d in request.source_documents_data:
+            d_id = d.get("id")
+            if not any(sd.id == d_id for sd in source_docs):
+                txt = d.get("text") or d.get("full_text") or d.get("preview_snippet") or ""
+                if txt.strip():
+                    reconstructed = process_plain_text(txt, d.get("filename") or "Uploaded_Source.txt")
+                    if d_id:
+                        reconstructed.id = d_id
+                    save_source_doc(reconstructed)
+                    source_docs.append(reconstructed)
 
     if not source_docs:
         raise HTTPException(
@@ -286,15 +354,22 @@ async def create_audit(request: AuditCreateRequest, background_tasks: Background
     )
 
     save_audit(report)
-    background_tasks.add_task(execute_audit_pipeline, audit_id)
-    return report
+    await execute_audit_pipeline(audit_id)
+    completed_report = get_audit(audit_id)
+    return completed_report or report
 
 @app.get("/api/audits", response_model=List[AuditListItem])
 def get_all_audits():
+    # NOTE: SQLite on Vercel serverless is ephemeral per instance.
+    # Audits created on other serverless instances may not appear here;
+    # the frontend client history combines server records with localStorage.
     return list_audits()
 
 @app.get("/api/audits/{audit_id}", response_model=AuditReport)
 def get_audit_by_id(audit_id: str):
+    # NOTE: SQLite on Vercel serverless is ephemeral per instance.
+    # If the instance changed between requests, get_audit may return None.
+    # The frontend client resilience layer reads from browser storage (sessionStorage/localStorage) first.
     report = get_audit(audit_id)
     if not report:
         raise HTTPException(status_code=404, detail=f"Audit with ID '{audit_id}' not found.")
@@ -315,16 +390,19 @@ def get_audit_inputs(audit_id: str):
     )
 
 @app.post("/api/audits/{audit_id}/rerun", response_model=AuditReport)
-async def rerun_audit(audit_id: str, request: AuditRerunRequest, background_tasks: BackgroundTasks):
+async def rerun_audit(audit_id: str, request: AuditRerunRequest, background_tasks: BackgroundTasks = BackgroundTasks()):
+    # NOTE: SQLite on Vercel serverless is ephemeral per instance.
+    # If the parent audit is not present in SQLite on this instance, we proceed gracefully
+    # with the provided rerun request fields and source documents.
     parent = get_audit(audit_id)
-    if not parent:
+    if not parent and not (request.source_text or request.edited_documents):
         raise HTTPException(status_code=404, detail=f"Audit with ID '{audit_id}' not found.")
 
     if not request.answer_text.strip():
         raise HTTPException(status_code=400, detail="AI-generated answer text is required.")
 
     source_docs: List[SourceDocument] = []
-    parent_docs_map = {doc.id: doc for doc in parent.source_documents}
+    parent_docs_map = {doc.id: doc for doc in parent.source_documents} if parent else {}
 
     # 1. Retain kept documents by ID
     for doc_id in request.source_document_ids:
@@ -355,12 +433,12 @@ async def rerun_audit(audit_id: str, request: AuditRerunRequest, background_task
     new_audit_id = f"aud_{str(uuid.uuid4())[:10]}"
     now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    title = request.title or parent.title
+    title = request.title or (parent.title if parent else None)
     if not title or title.strip() == "Untitled Audit":
         first_line = request.answer_text.strip().splitlines()[0][:60]
         title = first_line if first_line else "Audit Review"
 
-    options = request.options or parent.options
+    options = request.options or (parent.options if parent else AuditOptions())
 
     new_report = AuditReport(
         id=new_audit_id,
@@ -378,8 +456,9 @@ async def rerun_audit(audit_id: str, request: AuditRerunRequest, background_task
     )
 
     save_audit(new_report)
-    background_tasks.add_task(execute_audit_pipeline, new_audit_id)
-    return new_report
+    await execute_audit_pipeline(new_audit_id)
+    completed_new_report = get_audit(new_audit_id)
+    return completed_new_report or new_report
 
 @app.delete("/api/audits/{audit_id}")
 def delete_audit_by_id(audit_id: str):

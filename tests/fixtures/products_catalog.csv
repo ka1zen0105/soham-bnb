@@ -1,0 +1,4 @@
+sku,product_name,inventory_count,unit_price
+SKU-101,Titanium Sensor,450,$129.99
+SKU-102,Optic Transceiver,120,$89.50
+SKU-103,Precision Calibrator,85,$340.00

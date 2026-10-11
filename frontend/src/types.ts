@@ -29,6 +29,10 @@ export interface Passage {
   text: string;
   char_start: number;
   char_end: number;
+  unit_index?: number;
+  unit_label?: string;
+  unit_type?: string;
+  is_ocr?: boolean;
 }
 
 export interface SourceDocument {
@@ -41,6 +45,9 @@ export interface SourceDocument {
   passage_count: number;
   passages?: Passage[];
   source_url?: string;
+  units?: any[];
+  warnings?: string[];
+  meta?: Record<string, any>;
 }
 
 export interface EvidenceQuote {
@@ -60,6 +67,9 @@ export interface EvidenceQuote {
   context_before?: string;
   context_after?: string;
   extraction_error?: string;
+  unit_label?: string;
+  unit_type?: string;
+  is_ocr?: boolean;
 }
 
 export interface NumericalDiscrepancy {
@@ -104,6 +114,7 @@ export interface ClaimItem {
   safety_issues: SafetyIssue[];
   sub_claims?: any[];
   provenance_audit?: any;
+  is_ocr_supported?: boolean;
 }
 
 export interface AuditSummary {
@@ -156,6 +167,7 @@ export interface AuditListItem {
   supported_count: number;
   insufficient_count: number;
   ambiguous_count: number;
+  conflicting_count?: number;
   source_doc_count: number;
   parent_audit_id?: string | null;
 }

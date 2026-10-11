@@ -5,6 +5,13 @@ from typing import List, Optional, Dict, Any
 import tempfile
 from backend.models import AuditReport, AuditListItem, AuditStatusEnum, SourceDocument
 
+# NOTE: SQLite is not persistent on Vercel serverless deployments.
+# Each Vercel serverless function instance runs in an isolated ephemeral sandbox
+# with its own temporary /tmp filesystem that is not shared between requests,
+# and which resets on cold starts.
+# Therefore, audit creation endpoints return the complete payload directly, and
+# client-side browser storage (sessionStorage and localStorage) acts as the resilient
+# persistence layer for audits.
 DB_PATH = os.environ.get("DB_PATH") or (
     os.path.join(tempfile.gettempdir(), "second_opinion.db")
     if os.environ.get("VERCEL")
@@ -70,8 +77,8 @@ def save_audit(report: AuditReport):
         INSERT OR REPLACE INTO audits (
             id, title, created_at, status, current_step, progress_percentage,
             error_message, total_claims, supported_count, contradicted_count,
-            insufficient_count, ambiguous_count, conflicting_count, source_doc_count, report_data
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            insufficient_count, ambiguous_count, conflicting_count, source_doc_count, parent_audit_id, report_data
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         report.id,
         report.title,
@@ -87,6 +94,7 @@ def save_audit(report: AuditReport):
         report.summary.ambiguous_count,
         getattr(report.summary, "conflicting_count", 0),
         len(report.source_documents),
+        report.parent_audit_id,
         report_json
     ))
     conn.commit()
@@ -108,7 +116,7 @@ def list_audits() -> List[AuditListItem]:
     cursor = conn.cursor()
     cursor.execute("""
         SELECT id, title, created_at, status, total_claims, contradicted_count,
-               supported_count, insufficient_count, ambiguous_count, conflicting_count, source_doc_count
+               supported_count, insufficient_count, ambiguous_count, conflicting_count, source_doc_count, parent_audit_id
         FROM audits
         ORDER BY created_at DESC
     """)

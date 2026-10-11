@@ -74,7 +74,11 @@ def get_doc_passages(doc: Dict[str, Any]) -> List[Passage]:
                     passage_number=p_num,
                     text=s,
                     char_start=p.char_start,
-                    char_end=p.char_end
+                    char_end=p.char_end,
+                    unit_index=p.unit_index,
+                    unit_label=p.unit_label,
+                    unit_type=p.unit_type,
+                    is_ocr=p.is_ocr
                 ))
                 p_num += 1
             for si in range(len(sents) - 1):
@@ -87,7 +91,11 @@ def get_doc_passages(doc: Dict[str, Any]) -> List[Passage]:
                     passage_number=p_num,
                     text=comb,
                     char_start=p.char_start,
-                    char_end=p.char_end
+                    char_end=p.char_end,
+                    unit_index=p.unit_index,
+                    unit_label=p.unit_label,
+                    unit_type=p.unit_type,
+                    is_ocr=p.is_ocr
                 ))
                 p_num += 1
         return refined
@@ -412,7 +420,10 @@ def verify_single_claim(
                         similarity_score=con_r["confidence"],
                         relationship=EvidenceRelationshipEnum.CONTRADICTS,
                         is_contradiction=True,
-                        exact_match_verified=True
+                        exact_match_verified=True,
+                        unit_label=getattr(p_passage, "unit_label", None),
+                        unit_type=getattr(p_passage, "unit_type", "body"),
+                        is_ocr=getattr(p_passage, "is_ocr", False) or (getattr(p_passage, "unit_type", None) == "figure_ocr")
                     ))
             elif p_sup:
                 part["verdict"] = "SUPPORTED"
@@ -429,7 +440,10 @@ def verify_single_claim(
                     similarity_score=sup_r["confidence"],
                     relationship=EvidenceRelationshipEnum.ENTAILS,
                     is_contradiction=False,
-                    exact_match_verified=True
+                    exact_match_verified=True,
+                    unit_label=getattr(p_passage, "unit_label", None),
+                    unit_type=getattr(p_passage, "unit_type", "body"),
+                    is_ocr=getattr(p_passage, "is_ocr", False) or (getattr(p_passage, "unit_type", None) == "figure_ocr")
                 ))
             else:
                 part["verdict"] = "INSUFFICIENT_EVIDENCE"
@@ -521,7 +535,10 @@ def verify_single_claim(
             similarity_score=r["confidence"],
             relationship=EvidenceRelationshipEnum.ENTAILS if r["verdict"] == VerdictEnum.SUPPORTED else EvidenceRelationshipEnum.CONTRADICTS,
             is_contradiction=(r["verdict"] == VerdictEnum.CONTRADICTED),
-            exact_match_verified=True
+            exact_match_verified=True,
+            unit_label=getattr(p, "unit_label", None),
+            unit_type=getattr(p, "unit_type", "body"),
+            is_ocr=getattr(p, "is_ocr", False) or (getattr(p, "unit_type", None) == "figure_ocr")
         )
         if r["verdict"] == VerdictEnum.SUPPORTED:
             supporting_quotes.append(eq)
@@ -530,6 +547,14 @@ def verify_single_claim(
 
     claim.supporting_evidence = supporting_quotes
     claim.contradicting_evidence = contradicting_quotes
+
+    # Check if verdict is supported solely by OCR text
+    if claim.verdict == VerdictEnum.SUPPORTED and claim.supporting_evidence:
+        all_ocr = all(getattr(eq, "is_ocr", False) or getattr(eq, "unit_type", "") == "figure_ocr" for eq in claim.supporting_evidence)
+        if all_ocr:
+            claim.is_ocr_supported = True
+            claim.confidence_score = round(max(0.60, claim.confidence_score * 0.85), 2)
+            claim.confidence_basis = "Supported from extracted image text (OCR) with adjusted confidence threshold."
 
     # Attach numerical analysis if present
     for r in shown:

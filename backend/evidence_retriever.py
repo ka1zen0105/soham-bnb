@@ -200,5 +200,8 @@ def create_grounded_evidence_quote(
         retrieval_timestamp=now_iso,
         context_before=before_ctx,
         context_after=after_ctx,
-        extraction_error=None if is_verbatim else "Quote could not be mapped to verbatim passage offset."
+        extraction_error=None if is_verbatim else "Quote could not be mapped to verbatim passage offset.",
+        unit_label=getattr(passage, "unit_label", None),
+        unit_type=getattr(passage, "unit_type", "body"),
+        is_ocr=getattr(passage, "is_ocr", False) or (getattr(passage, "unit_type", None) == "figure_ocr")
     )

@@ -154,5 +154,23 @@ class TestAuditRerunAndInputs(unittest.TestCase):
 
         delete_audit(orig_id)
 
+    def test_create_audit_returns_complete_result_immediately(self):
+        """Verify POST /api/audits returns complete audit with claims, verdicts, and metrics synchronously."""
+        req = AuditCreateRequest(
+            title="Immediate Complete Audit Test",
+            answer_text="Global inflation slowed to 4.2% in 2024 according to official reports.",
+            source_text="Official reports indicate global inflation decelerated to 4.2% across 2024."
+        )
+        report = asyncio.run(create_audit(req))
+        self.assertIsNotNone(report)
+        self.assertEqual(report.status, AuditStatusEnum.COMPLETED)
+        self.assertEqual(report.progress_percentage, 100)
+        self.assertTrue(len(report.claims) > 0)
+        self.assertTrue(len(report.source_documents) > 0)
+        self.assertEqual(report.summary.total_claims, len(report.claims))
+        self.assertTrue(report.summary.supported_count > 0 or report.summary.traceable_claims_count > 0)
+        self.assertTrue(bool(report.answer_text))
+        delete_audit(report.id)
+
 if __name__ == "__main__":
     unittest.main()

@@ -11,10 +11,20 @@ import {
   ChevronDown,
   ChevronUp,
   Check,
-  Plus
+  Plus,
+  Eye,
+  Globe,
+  AlertTriangle,
+  Presentation,
+  Table,
+  Image,
+  Archive,
+  FileCode,
+  BookOpen
 } from 'lucide-react';
 import type { AuditInputsResponse, SourceDocument, AuditOptions, EditedDocumentInput } from '../types';
-import { uploadSourceFile, rerunAudit, fetchAudit, pasteSourceText } from '../services/api';
+import { uploadSourceFile, rerunAudit, fetchAudit, pasteSourceText, fetchPaperByDoiOrUrl } from '../services/api';
+import { saveAuditToStorage } from '../services/auditStorage';
 
 interface EditInputsDrawerProps {
   isOpen: boolean;
@@ -28,9 +38,12 @@ interface EditInputsDrawerProps {
 interface DraftDoc {
   id: string;
   filename: string;
+  file_type?: string;
   size_bytes: number;
   page_count: number;
   extracted_text: string;
+  warnings?: string[];
+  word_count?: number;
   isEdited?: boolean;
 }
 
@@ -48,10 +61,12 @@ export const EditInputsDrawer: React.FC<EditInputsDrawerProps> = ({
   const [editingDocId, setEditingDocId] = useState<string | null>(null);
   const [editingDocText, setEditingDocText] = useState('');
 
-  // Source upload / paste tabs
-  const [sourceTab, setSourceTab] = useState<'upload' | 'paste'>('upload');
+  // Source upload / paste / paper tabs
+  const [sourceTab, setSourceTab] = useState<'upload' | 'paper' | 'paste'>('upload');
   const [pastedText, setPastedText] = useState('');
   const [pastedFilename, setPastedFilename] = useState('');
+  const [paperQuery, setPaperQuery] = useState('');
+  const [previewDoc, setPreviewDoc] = useState<DraftDoc | null>(null);
 
   const [uploading, setUploading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -94,9 +109,12 @@ export const EditInputsDrawer: React.FC<EditInputsDrawerProps> = ({
         (initialInputs.source_documents || []).map(d => ({
           id: d.id,
           filename: d.filename,
+          file_type: d.file_type,
           size_bytes: d.size_bytes,
           page_count: d.page_count,
           extracted_text: d.extracted_text || '',
+          warnings: d.warnings || [],
+          word_count: d.extracted_text ? d.extracted_text.trim().split(/\s+/).filter(Boolean).length : 0,
           isEdited: false
         }))
       );
@@ -187,25 +205,58 @@ export const EditInputsDrawer: React.FC<EditInputsDrawerProps> = ({
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files || e.target.files.length === 0) return;
-    const file = e.target.files[0];
+    const files = Array.from(e.target.files);
+    e.target.value = '';
     try {
       setUploading(true);
       setErrorMsg(null);
-      const res = await uploadSourceFile(file);
+      for (const file of files) {
+        try {
+          const res = await uploadSourceFile(file);
+          const newDoc: DraftDoc = {
+            id: res.id,
+            filename: res.filename,
+            file_type: res.file_type,
+            size_bytes: res.size_bytes,
+            page_count: res.page_count,
+            extracted_text: res.preview_snippet || '',
+            warnings: res.warnings || [],
+            word_count: (res.preview_snippet || '').trim().split(/\s+/).filter(Boolean).length,
+            isEdited: false
+          };
+          setDocs(prev => [...prev, newDoc]);
+        } catch (fileErr: any) {
+          setErrorMsg(`Failed to upload ${file.name}: ${fileErr.message}`);
+        }
+      }
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleFetchPaper = async () => {
+    if (!paperQuery.trim()) return;
+    try {
+      setUploading(true);
+      setErrorMsg(null);
+      const res = await fetchPaperByDoiOrUrl(paperQuery.trim());
       const newDoc: DraftDoc = {
         id: res.id,
         filename: res.filename,
+        file_type: res.file_type,
         size_bytes: res.size_bytes,
         page_count: res.page_count,
         extracted_text: res.preview_snippet || '',
+        warnings: res.warnings || [],
+        word_count: (res.preview_snippet || '').trim().split(/\s+/).filter(Boolean).length,
         isEdited: false
       };
       setDocs(prev => [...prev, newDoc]);
+      setPaperQuery('');
     } catch (err: any) {
-      setErrorMsg(err.message || 'File upload failed');
+      setErrorMsg(err.message || 'Failed to fetch paper');
     } finally {
       setUploading(false);
-      e.target.value = '';
     }
   };
 
@@ -274,6 +325,22 @@ export const EditInputsDrawer: React.FC<EditInputsDrawerProps> = ({
         edited_documents: editedDocs
       });
 
+      // Save full rerun result to sessionStorage and localStorage
+      saveAuditToStorage(newAudit);
+
+      if (newAudit.status === 'COMPLETED') {
+        try {
+          sessionStorage.removeItem(storageKey);
+        } catch {
+          // Ignore
+        }
+        onClose();
+        navigate(`/audit/${newAudit.id}`);
+        return;
+      } else if (newAudit.status === 'FAILED') {
+        throw new Error(newAudit.error_message || 'Audit execution failed');
+      }
+
       const newId = newAudit.id;
       let completed = false;
       let attempts = 0;
@@ -282,6 +349,7 @@ export const EditInputsDrawer: React.FC<EditInputsDrawerProps> = ({
         await new Promise(r => setTimeout(r, 500));
         attempts++;
         const statusReport = await fetchAudit(newId);
+        saveAuditToStorage(statusReport);
 
         setActiveStepText(statusReport.current_step || 'Auditing assertions...');
         setProgressPct(statusReport.progress_percentage || 25);
@@ -431,93 +499,117 @@ export const EditInputsDrawer: React.FC<EditInputsDrawerProps> = ({
               {/* Existing Documents List */}
               {docs.length > 0 && (
                 <div className="space-y-2">
-                  {docs.map(doc => (
-                    <div
-                      key={doc.id}
-                      className="border border-[#E8EAEE] rounded-[10px] bg-white overflow-hidden transition-all"
-                    >
-                      <div className="p-3 flex items-center justify-between gap-3">
-                        <div
-                          onClick={() => handleOpenDocEdit(doc)}
-                          className="flex items-center gap-2.5 min-w-0 cursor-pointer flex-1 group"
-                          title="Click to view and edit document text"
-                        >
-                          <FileText className="w-4 h-4 text-[#12C56E] shrink-0" />
-                          <div className="min-w-0">
-                            <p className="text-[12px] font-bold text-[var(--ink)] truncate group-hover:text-[#12C56E] transition-colors">
-                              {doc.filename}
-                            </p>
-                            <p className="text-[11px] text-[var(--text-secondary)] font-mono">
-                              {doc.page_count} page{doc.page_count !== 1 ? 's' : ''} · {(doc.size_bytes / 1024).toFixed(1)} KB
-                              {doc.isEdited && (
-                                <span className="ml-2 text-emerald-600 font-bold font-sans">
-                                  (Edited)
-                                </span>
-                              )}
-                            </p>
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
+                  {docs.map(doc => {
+                    const ext = doc.filename.split('.').pop()?.toLowerCase() || '';
+                    return (
+                      <div
+                        key={doc.id}
+                        className="border border-[#E8EAEE] rounded-[10px] bg-white overflow-hidden transition-all"
+                      >
+                        <div className="p-3 flex items-center justify-between gap-3">
+                          <div
                             onClick={() => handleOpenDocEdit(doc)}
-                            className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--ink)] rounded-[6px] hover:bg-[#F2F4F7]"
-                            title="Edit full text"
+                            className="flex items-center gap-2.5 min-w-0 cursor-pointer flex-1 group"
+                            title="Click to view and edit document text"
                           >
-                            <FileEdit className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleRemoveDoc(doc.id)}
-                            className="p-1.5 text-[var(--text-secondary)] hover:text-red-600 rounded-[6px] hover:bg-red-50"
-                            title="Remove document"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      </div>
+                            <FileText className="w-4 h-4 text-[#12C56E] shrink-0" />
+                            <div className="min-w-0">
+                              <p className="text-[12px] font-bold text-[var(--ink)] truncate group-hover:text-[#12C56E] transition-colors">
+                                {doc.filename}
+                              </p>
+                              <div className="text-[11px] text-[var(--text-secondary)] font-mono flex items-center gap-2 flex-wrap mt-0.5">
+                                <span>{doc.page_count} unit{doc.page_count !== 1 ? 's' : ''}</span>
+                                <span>·</span>
+                                <span>{(doc.size_bytes / 1024).toFixed(1)} KB</span>
+                                {doc.isEdited && (
+                                  <span className="text-emerald-600 font-bold font-sans">
+                                    (Edited)
+                                  </span>
+                                )}
+                              </div>
 
-                      {/* Inline Document Text Editor */}
-                      {editingDocId === doc.id && (
-                        <div className="p-3 border-t border-[#E8EAEE] bg-[#F7F8F6] space-y-2.5">
-                          <div className="flex items-center justify-between text-[11px]">
-                            <span className="font-bold text-[var(--ink)]">Editing: {doc.filename}</span>
-                            <span className="text-[var(--text-secondary)] font-mono">
-                              {editingDocText.length} characters
-                            </span>
+                              {doc.warnings && doc.warnings.length > 0 && (
+                                <div className="mt-1 flex flex-wrap gap-1">
+                                  {doc.warnings.map((w, wi) => (
+                                    <span key={wi} className="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
+                                      <AlertTriangle className="w-2.5 h-2.5 text-amber-600" />
+                                      {w}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
                           </div>
-                          <textarea
-                            rows={8}
-                            value={editingDocText}
-                            onChange={e => setEditingDocText(e.target.value)}
-                            className="w-full p-2.5 text-[12px] font-mono leading-relaxed border border-[#E8EAEE] rounded-[8px] bg-white focus:outline-none focus:border-[#12C56E]"
-                          />
-                          <div className="flex items-center justify-end gap-2">
+
+                          <div className="flex items-center gap-1.5 shrink-0">
                             <button
                               type="button"
-                              onClick={() => setEditingDocId(null)}
-                              className="px-2.5 py-1 text-[11px] font-semibold text-[var(--text-secondary)] hover:text-[var(--ink)]"
+                              onClick={() => setPreviewDoc(doc)}
+                              className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--ink)] rounded-[6px] hover:bg-[#F2F4F7]"
+                              title="Preview extracted text"
                             >
-                              Cancel
+                              <Eye className="w-3.5 h-3.5" />
                             </button>
                             <button
                               type="button"
-                              onClick={() => handleSaveDocText(doc.id)}
-                              className="px-3 py-1 bg-[#12C56E] hover:bg-[#0fa95d] text-white text-[11px] font-bold rounded-[6px] flex items-center gap-1"
+                              onClick={() => handleOpenDocEdit(doc)}
+                              className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--ink)] rounded-[6px] hover:bg-[#F2F4F7]"
+                              title="Edit full text"
                             >
-                              <Check className="w-3 h-3" />
-                              <span>Apply Edits</span>
+                              <FileEdit className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveDoc(doc.id)}
+                              className="p-1.5 text-[var(--text-secondary)] hover:text-red-600 rounded-[6px] hover:bg-red-50"
+                              title="Remove document"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
                             </button>
                           </div>
                         </div>
-                      )}
-                    </div>
-                  ))}
+
+                        {/* Inline Document Text Editor */}
+                        {editingDocId === doc.id && (
+                          <div className="p-3 border-t border-[#E8EAEE] bg-[#F7F8F6] space-y-2.5">
+                            <div className="flex items-center justify-between text-[11px]">
+                              <span className="font-bold text-[var(--ink)]">Editing: {doc.filename}</span>
+                              <span className="text-[var(--text-secondary)] font-mono">
+                                {editingDocText.length} characters
+                              </span>
+                            </div>
+                            <textarea
+                              rows={8}
+                              value={editingDocText}
+                              onChange={e => setEditingDocText(e.target.value)}
+                              className="w-full p-2.5 text-[12px] font-mono leading-relaxed border border-[#E8EAEE] rounded-[8px] bg-white focus:outline-none focus:border-[#12C56E]"
+                            />
+                            <div className="flex items-center justify-end gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setEditingDocId(null)}
+                                className="px-2.5 py-1 text-[11px] font-semibold text-[var(--text-secondary)] hover:text-[var(--ink)]"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleSaveDocText(doc.id)}
+                                className="px-3 py-1 bg-[#12C56E] hover:bg-[#0fa95d] text-white text-[11px] font-bold rounded-[6px] flex items-center gap-1"
+                              >
+                                <Check className="w-3 h-3" />
+                                <span>Apply Edits</span>
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
 
-              {/* Add New Source Section (Tabs: Upload Files / Paste Text) */}
+              {/* Add New Source Section (Tabs: Upload Files / DOI / Paste Text) */}
               <div className="border border-[#E8EAEE] rounded-[12px] p-4 bg-white space-y-3">
                 <div className="flex items-center gap-2 border-b border-[#E8EAEE] pb-2.5">
                   <span className="text-[12px] font-bold text-[var(--ink)]">Add Document:</span>
@@ -533,6 +625,15 @@ export const EditInputsDrawer: React.FC<EditInputsDrawerProps> = ({
                     </button>
                     <button
                       type="button"
+                      onClick={() => setSourceTab('paper')}
+                      className={`px-2.5 py-1 rounded-[6px] transition-colors ${
+                        sourceTab === 'paper' ? 'bg-white text-[var(--ink)] shadow-xs' : 'text-[var(--text-secondary)]'
+                      }`}
+                    >
+                      DOI / arXiv / URL
+                    </button>
+                    <button
+                      type="button"
                       onClick={() => setSourceTab('paste')}
                       className={`px-2.5 py-1 rounded-[6px] transition-colors ${
                         sourceTab === 'paste' ? 'bg-white text-[var(--ink)] shadow-xs' : 'text-[var(--text-secondary)]'
@@ -543,24 +644,50 @@ export const EditInputsDrawer: React.FC<EditInputsDrawerProps> = ({
                   </div>
                 </div>
 
-                {sourceTab === 'upload' ? (
-                  <label className="border-2 border-dashed border-[#E8EAEE] hover:border-[#12C56E] rounded-[10px] p-5 flex flex-col items-center justify-center cursor-pointer transition-colors bg-[#FAFAFA]">
+                {sourceTab === 'upload' && (
+                  <label className="border-2 border-dashed border-[#E8EAEE] hover:border-[#12C56E] rounded-[10px] p-5 flex flex-col items-center justify-center cursor-pointer transition-colors bg-[#FAFAFA] text-center">
                     <Upload className="w-5 h-5 text-[var(--text-secondary)] mb-1.5" />
                     <span className="text-[12px] font-bold text-[var(--ink)]">
-                      {uploading ? 'Processing document...' : 'Click to upload PDF, DOCX, or TXT'}
+                      {uploading ? 'Processing documents...' : 'Select source files or drag & drop'}
                     </span>
                     <span className="text-[11px] text-[var(--text-secondary)] mt-0.5">
-                      Max file size 25MB
+                      PDF, Word, PowerPoint, Excel, CSV, JSON, HTML, Markdown, text, images, ZIP
                     </span>
                     <input
                       type="file"
+                      multiple
                       disabled={uploading}
                       onChange={handleFileUpload}
-                      accept=".pdf,.docx,.doc,.txt,.md"
+                      accept=".pdf,.docx,.doc,.rtf,.odt,.txt,.md,.html,.htm,.pptx,.ppt,.odp,.json,.jsonl,.csv,.tsv,.xlsx,.xls,.xml,.yaml,.yml,.bib,.ris,.tex,.epub,.png,.jpg,.jpeg,.webp,.zip"
                       className="hidden"
                     />
                   </label>
-                ) : (
+                )}
+
+                {sourceTab === 'paper' && (
+                  <div className="space-y-2">
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={paperQuery}
+                        onChange={e => setPaperQuery(e.target.value)}
+                        onKeyDown={e => e.key === 'Enter' && handleFetchPaper()}
+                        placeholder="e.g. 10.1038/..., arXiv:2303.08774, or https://..."
+                        className="flex-1 px-3 py-1.5 text-[12px] border border-[#E8EAEE] rounded-[8px] focus:outline-none focus:border-[#12C56E]"
+                      />
+                      <button
+                        type="button"
+                        disabled={uploading || !paperQuery.trim()}
+                        onClick={handleFetchPaper}
+                        className="px-3 py-1.5 bg-[#12C56E] text-white text-[12px] font-bold rounded-[8px] hover:bg-[#0fa95d] disabled:opacity-50"
+                      >
+                        Fetch
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {sourceTab === 'paste' && (
                   <div className="space-y-2">
                     <input
                       type="text"
@@ -617,6 +744,43 @@ export const EditInputsDrawer: React.FC<EditInputsDrawerProps> = ({
 
         </div>
       </div>
+
+      {/* Preview Extracted Text Modal */}
+      {previewDoc && (
+        <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/40 backdrop-blur-xs p-4">
+          <div className="bg-white rounded-[16px] border border-[#E8EAEE] max-w-2xl w-full max-h-[85vh] flex flex-col shadow-xl">
+            <div className="p-4 border-b border-[#E8EAEE] flex items-center justify-between">
+              <div>
+                <h3 className="text-[15px] font-extrabold text-[var(--ink)] truncate max-w-lg">
+                  {previewDoc.filename}
+                </h3>
+                <span className="text-[11px] text-[var(--text-secondary)] font-mono">
+                  {previewDoc.page_count} unit(s) · {previewDoc.word_count || 0} words
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPreviewDoc(null)}
+                className="p-1 rounded-[6px] hover:bg-[#F2F4F7] text-[var(--text-secondary)]"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-4 overflow-y-auto flex-1 font-mono text-[12px] leading-relaxed text-[var(--ink)] bg-[#F8F9FA] whitespace-pre-wrap select-text">
+              {previewDoc.extracted_text || '[No text extracted]'}
+            </div>
+            <div className="p-3.5 border-t border-[#E8EAEE] flex justify-end">
+              <button
+                type="button"
+                onClick={() => setPreviewDoc(null)}
+                className="px-3.5 py-1.5 bg-[#F2F4F7] text-[var(--ink)] rounded-[8px] font-bold text-[12px] hover:bg-[#E5E7EB]"
+              >
+                Close Preview
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

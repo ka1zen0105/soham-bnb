@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import type { AuditReport, ClaimItem, EvidenceQuote, Verdict, AuditInputsResponse } from '../types';
 import { fetchAudit, fetchAuditInputs, API_BASE } from '../services/api';
+import { getAuditFromStorage, saveAuditToStorage } from '../services/auditStorage';
 import { getVerdictStyle } from '../lib/verdict';
 import { EditInputsDrawer } from '../components/EditInputsDrawer';
 
@@ -27,6 +28,46 @@ interface AuditResultsPageProps {
   auditId: string;
   navigate: (route: string) => void;
 }
+
+const renderEvidenceBadge = (ev: EvidenceQuote, isOcrClaim?: boolean) => {
+  const isOcr = Boolean(ev.is_ocr || isOcrClaim || ev.unit_type === 'figure_ocr');
+  if (isOcr) {
+    return (
+      <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#FEF3C7] text-[#92400E] border border-[#FDE68A] uppercase tracking-wide">
+        From image (OCR)
+      </span>
+    );
+  }
+  if (ev.unit_type === 'reference') {
+    return (
+      <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#E0E7FF] text-[#3730A3] border border-[#C7D2FE] uppercase tracking-wide">
+        References
+      </span>
+    );
+  }
+  if (ev.unit_type === 'table' || ev.unit_type === 'sheet_row') {
+    return (
+      <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#F3F4F6] text-[#374151] border border-[#E5E7EB] uppercase tracking-wide">
+        Table
+      </span>
+    );
+  }
+  if (ev.unit_type === 'caption') {
+    return (
+      <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#F3F4F6] text-[#374151] border border-[#E5E7EB] uppercase tracking-wide">
+        Figure caption
+      </span>
+    );
+  }
+  if (ev.unit_type === 'json_path') {
+    return (
+      <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#F5F3FF] text-[#6D28D9] border border-[#DDD6FE] uppercase tracking-wide">
+        JSON Path
+      </span>
+    );
+  }
+  return null;
+};
 
 export const AuditResultsPage: React.FC<AuditResultsPageProps> = ({ auditId, navigate }) => {
   const [report, setReport] = useState<AuditReport | null>(null);
@@ -79,14 +120,43 @@ export const AuditResultsPage: React.FC<AuditResultsPageProps> = ({ auditId, nav
     (async () => {
       try {
         setLoading(true);
+        setError(null);
+
+        // 1. Load order: Browser storage first (sessionStorage, then localStorage)
+        const storedReport = getAuditFromStorage(auditId);
+        if (storedReport) {
+          if (!alive) return;
+          setReport(storedReport);
+          if (storedReport.claims && storedReport.claims.length > 0) {
+            setSelectedId(storedReport.claims[0].id);
+          }
+          setLoading(false);
+
+          // Attempt background sync if server is reachable
+          try {
+            const serverReport = await fetchAudit(auditId);
+            if (alive && serverReport) {
+              setReport(serverReport);
+              saveAuditToStorage(serverReport);
+            }
+          } catch {
+            // Ephemeral serverless instance may return 404; stored report is already showing
+          }
+          return;
+        }
+
+        // 2. If not found in storage, fetch from GET /api/audits/{id}
         const data = await fetchAudit(auditId);
         if (!alive) return;
         setReport(data);
+        saveAuditToStorage(data);
         if (data.claims && data.claims.length > 0) {
           setSelectedId(data.claims[0].id);
         }
       } catch (err: any) {
-        if (alive) setError(err.message || 'Failed to load audit report');
+        if (alive) {
+          setError('This audit is no longer available. Run it again');
+        }
       } finally {
         if (alive) setLoading(false);
       }
@@ -228,17 +298,30 @@ export const AuditResultsPage: React.FC<AuditResultsPageProps> = ({ auditId, nav
 
   if (error || !report) {
     return (
-      <div className="flex items-center justify-center h-[calc(100vh-64px)] bg-white">
-        <div className="text-center max-w-sm p-6">
-          <AlertCircle className="w-8 h-8 text-[var(--contradicted-dot)] mx-auto" />
-          <p className="mt-3 text-[15px] font-bold text-[var(--ink)]">Unable to load audit</p>
-          <p className="mt-1 text-[13px] text-[var(--text-secondary)]">{error || 'Report not found'}</p>
-          <button
-            onClick={() => navigate('/')}
-            className="mt-4 px-4 py-2 border border-[var(--line)] rounded-[10px] text-[13px] font-bold text-[var(--ink)] hover:bg-[var(--surface-hover)]"
-          >
-            Back to Workspace
-          </button>
+      <div className="flex items-center justify-center min-h-[calc(100vh-64px)] bg-white px-4">
+        <div className="text-center max-w-md p-8 bg-white border border-[#E8EAEE] rounded-[16px] shadow-sm">
+          <AlertCircle className="w-10 h-10 text-[var(--accent)] mx-auto mb-3" />
+          <h2 className="text-[17px] font-extrabold text-[var(--ink)]">
+            Audit Not Available
+          </h2>
+          <p className="mt-2 text-[13px] text-[var(--text-secondary)] leading-relaxed">
+            This audit is no longer available. Run it again
+          </p>
+          <div className="mt-6 flex items-center justify-center gap-3">
+            <button
+              onClick={() => navigate('/audit/new')}
+              className="px-5 py-2.5 rounded-[10px] bg-[#12C56E] hover:bg-[#0EA95C] text-white text-[13px] font-bold transition-colors shadow-sm inline-flex items-center gap-2"
+            >
+              <RotateCcw className="w-4 h-4" />
+              <span>Run it again</span>
+            </button>
+            <button
+              onClick={() => navigate('/')}
+              className="px-4 py-2.5 rounded-[10px] border border-[#E8EAEE] text-[13px] font-bold text-[var(--ink)] hover:bg-[var(--surface-hover)] transition-colors"
+            >
+              Back to Workspace
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -519,6 +602,11 @@ export const AuditResultsPage: React.FC<AuditResultsPageProps> = ({ auditId, nav
                             <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: vStyle.dot }} />
                             <span>{vStyle.shortLabel}</span>
                           </span>
+                          {c.is_ocr_supported && (
+                            <span className="px-1 py-0.2 rounded text-[9.5px] font-bold bg-[#FEF3C7] text-[#92400E] border border-[#FDE68A] uppercase">
+                              From image (OCR)
+                            </span>
+                          )}
                         </div>
                         <span className="font-mono text-[var(--text-secondary)] text-[11px]">
                           {evCount} evidence
@@ -667,8 +755,18 @@ export const AuditResultsPage: React.FC<AuditResultsPageProps> = ({ auditId, nav
                               <blockquote className="font-serif italic text-[18px] leading-[1.7] text-[var(--ink)]">
                                 "{ev.text}"
                               </blockquote>
-                              <div className="text-[12px] font-mono text-[var(--text-secondary)]">
-                                {ev.filename} {ev.page_number ? `· Page ${ev.page_number}` : ''} {ev.passage_id ? `· Passage ${ev.passage_id}` : ''}
+                              <div className="text-[12px] font-mono text-[var(--text-secondary)] flex items-center gap-2 flex-wrap">
+                                <span>{ev.filename}</span>
+                                <span>·</span>
+                                <span className="font-semibold text-[var(--ink)]">
+                                  {ev.unit_label || (ev.page_number ? `Page ${ev.page_number}` : 'Passage')}
+                                </span>
+                                {renderEvidenceBadge(ev, focusedClaim?.is_ocr_supported)}
+                                {ev.passage_id && (
+                                  <span className="text-[var(--text-secondary)] text-[11px]">
+                                    Passage #{ev.passage_id}
+                                  </span>
+                                )}
                               </div>
                             </div>
                           ))}
@@ -815,8 +913,10 @@ export const AuditResultsPage: React.FC<AuditResultsPageProps> = ({ auditId, nav
                             key={i}
                             className="bg-[var(--surface-alt)] border border-[var(--line)] rounded-[10px] p-4 text-[13px] font-mono leading-relaxed"
                           >
-                            <div className="text-[11px] text-[var(--text-secondary)] mb-2 font-semibold">
-                              Page {ev.page_number || 1} {ev.passage_id ? `· Passage #${ev.passage_id}` : ''}
+                            <div className="text-[11px] text-[var(--text-secondary)] mb-2 font-semibold flex items-center gap-2 flex-wrap">
+                              <span>{ev.unit_label || (ev.page_number ? `Page ${ev.page_number}` : `Passage #${ev.passage_id}`)}</span>
+                              {renderEvidenceBadge(ev, focusedClaim?.is_ocr_supported)}
+                              {ev.passage_id && <span>· Passage #{ev.passage_id}</span>}
                             </div>
                             <p className="text-[var(--ink)]">
                               <span style={{ backgroundColor: focusedVStyle.tint, color: focusedVStyle.text, padding: '2px 4px', borderRadius: '4px' }}>
@@ -951,8 +1051,13 @@ export const AuditResultsPage: React.FC<AuditResultsPageProps> = ({ auditId, nav
                                 <blockquote className="font-serif italic text-[17px] leading-relaxed text-[var(--ink)]">
                                   "{evidenceQuote.text}"
                                 </blockquote>
-                                <div className="text-[12px] font-mono text-[var(--text-secondary)]">
-                                  {evidenceQuote.filename} {evidenceQuote.page_number ? `· Page ${evidenceQuote.page_number}` : ''}
+                                <div className="text-[12px] font-mono text-[var(--text-secondary)] flex items-center gap-2 flex-wrap">
+                                  <span>{evidenceQuote.filename}</span>
+                                  <span>·</span>
+                                  <span className="font-semibold text-[var(--ink)]">
+                                    {evidenceQuote.unit_label || (evidenceQuote.page_number ? `Page ${evidenceQuote.page_number}` : '')}
+                                  </span>
+                                  {renderEvidenceBadge(evidenceQuote, c.is_ocr_supported)}
                                 </div>
                               </div>
                             ) : (

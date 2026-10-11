@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import type { AuditListItem } from '../types';
 import { fetchAuditsList, deleteAudit } from '../services/api';
+import { getSavedAuditsFromStorage, removeAuditFromStorage } from '../services/auditStorage';
 
 interface HistoryPageProps {
   navigate: (route: string) => void;
@@ -30,10 +31,38 @@ export const HistoryPage: React.FC<HistoryPageProps> = ({ navigate }) => {
     try {
       setLoading(true);
       setError(null);
-      const data = await fetchAuditsList();
-      setAudits(data);
+      let serverAudits: AuditListItem[] = [];
+      try {
+        serverAudits = await fetchAuditsList();
+      } catch (err) {
+        console.warn('Server fetchAuditsList failed, falling back to browser storage:', err);
+      }
+
+      // Read saved audits from browser localStorage
+      const localAudits = getSavedAuditsFromStorage();
+
+      // Combine server audits and local audits, preferring freshest records
+      const auditMap = new Map<string, AuditListItem>();
+
+      // Put local audits in map first
+      for (const la of localAudits) {
+        auditMap.set(la.id, la);
+      }
+
+      // Put server audits in map (server takes precedence if present)
+      for (const sa of serverAudits) {
+        auditMap.set(sa.id, sa);
+      }
+
+      const combined = Array.from(auditMap.values());
+      setAudits(combined);
     } catch (err: any) {
-      setError(err.message || 'Failed to load audit history');
+      const fallback = getSavedAuditsFromStorage();
+      if (fallback.length > 0) {
+        setAudits(fallback);
+      } else {
+        setError(err.message || 'Failed to load audit history');
+      }
     } finally {
       setLoading(false);
     }
@@ -45,13 +74,22 @@ export const HistoryPage: React.FC<HistoryPageProps> = ({ navigate }) => {
 
   const handleDelete = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!window.confirm(`Are you sure you want to delete audit '${id}'? This will permanently remove its claim ledger from the SQLite database.`)) {
+    if (!window.confirm(`Are you sure you want to delete audit '${id}'? This will permanently remove its claim ledger.`)) {
       return;
     }
 
     try {
       setDeletingId(id);
-      await deleteAudit(id);
+      // Attempt server deletion; if server returns 404 or fails on ephemeral serverless instance, don't block
+      try {
+        await deleteAudit(id);
+      } catch (err) {
+        console.warn('Server audit deletion failed or not found, removing locally:', err);
+      }
+
+      // Remove from browser storage (sessionStorage and localStorage)
+      removeAuditFromStorage(id);
+
       setAudits(prev => prev.filter(a => a.id !== id));
     } catch (err: any) {
       alert(`Delete failed: ${err.message}`);
